@@ -44,6 +44,7 @@ class RealtimeAsrEngine:
         self._next_seq = 1
         self._got_terminal = False
         self.accepted = False
+        self._last_visible = ""
 
     async def start(self) -> None:
         connect_kwargs: dict[str, Any] = {"open_timeout": self.settings.asr_handshake_timeout_sec}
@@ -186,17 +187,18 @@ class RealtimeAsrEngine:
                 self._hypothesis = str(event["text"])
             else:
                 self._hypothesis = merge_hypothesis(self._hypothesis, str(event.get("delta") or ""))
-            await self._emit(AsrEvent(kind="partial", text=visible_transcript(self._hypothesis)))
+            await self._publish_partial()
             return
         if kind == "transcription.done":
             text = event.get("text")
             if isinstance(text, str) and text:
                 self._hypothesis = text
             visible = visible_transcript(self._hypothesis)
+            self._last_visible = visible
             if self._finish_sent:
                 self._got_terminal = True
                 await self._emit(AsrEvent(kind="final", text=visible, timestamps=False))
-            else:
+            elif visible:
                 await self._emit(AsrEvent(kind="partial", text=visible, timestamps=False))
             return
         if kind == "error":
@@ -228,6 +230,13 @@ class RealtimeAsrEngine:
         if self._ws is None or self._closed:
             return
         await self._ws.send(json.dumps(payload, ensure_ascii=False))
+
+    async def _publish_partial(self) -> None:
+        visible = visible_transcript(self._hypothesis)
+        if not visible or visible == self._last_visible:
+            return
+        self._last_visible = visible
+        await self._emit(AsrEvent(kind="partial", text=visible))
 
     async def _emit(self, event: AsrEvent) -> None:
         await self._events.put(event)

@@ -25,7 +25,7 @@ const autoSend = ref(true)
 const muted = ref(false)
 const volume = ref(80)
 const errorText = ref("")
-const note = ref("按住式对话：先开始说话，说完再结束。播报时不会自动抢话。")
+const note = ref("说话时会显示识别。停顿或点「说完了」后才回答，播报时不会抢话。")
 const asrNote = ref("")
 const messages = ref<ChatMessage[]>([])
 const captureState = ref("")
@@ -193,6 +193,9 @@ async function beginSpeech() {
   try {
     stopMic = await startCapture({
       onFrame: (frame) => sendGate?.push(frame),
+      onError: (message) => {
+        if (generation === seqGuard) pushError(message)
+      },
       onStats: (stats: CaptureStats) => {
         if (generation !== seqGuard) return
         captureState.value = stats.contextState
@@ -210,14 +213,14 @@ async function beginSpeech() {
     return
   }
   if (generation !== seqGuard) return
-  socket?.send({ type: "speech.start" })
+  socket?.send({ type: "speech.start", auto_submit: autoSend.value })
   listening.value = true
   phase.value = "正在聆听"
-  micStatus.value = captureState.value === "running" ? "录音已启动，等待识别通道" : `录音上下文 ${captureState.value || "未知"}`
+  micStatus.value = "录音已启动，正在采集"
   window.setTimeout(() => {
     if (generation !== seqGuard || !listening.value) return
     if (sampleCount.value === 0) {
-      pushError("还没有收到麦克风采样。如果刚刚才允许权限，请再点一次「开始说话」。")
+      pushError("录音模块没有交出采样。请看浏览器是否允许麦克风；若刚允许，请再点一次「开始说话」。")
     }
   }, 1500)
 }
@@ -240,7 +243,7 @@ async function finishSpeech() {
   socket?.send({ type: "speech.finish", auto_submit: autoSend.value })
   listening.value = false
   phase.value = "正在识别"
-  micStatus.value = `已送出 ${frameCount.value} 帧 / ${sampleCount.value} 样本`
+  micStatus.value = `已采集 ${frameCount.value} 帧 / ${sampleCount.value} 样本`
 }
 
 async function cancelSpeech() {
@@ -348,7 +351,11 @@ onBeforeUnmount(() => {
           <span v-else-if="item.status === 'error'" class="badge">回答出错</span>
           <span v-else-if="item.status === 'streaming'" class="badge">正在生成</span>
         </article>
-        <p v-if="messages.length === 0" class="meta">还没有对话。可以打字发送，也可以开始说话。</p>
+        <article v-if="draft && listening" class="bubble user">
+          {{ draft }}
+          <span class="badge">正在识别</span>
+        </article>
+        <p v-if="messages.length === 0 && !(draft && listening)" class="meta">还没有对话。可以打字发送，也可以开始说话。</p>
       </div>
       <div class="composer">
         <textarea v-model="composer" placeholder="输入文字，或在关闭自动发送后修改识别结果" @keydown="onKeydown"></textarea>

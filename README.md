@@ -18,7 +18,15 @@
   -> Web Audio 按采样帧排队播放
 ```
 
-识别采样率固定 16000。合成采样率不要假定与识别相同。`stream=true` 时上游返回 `text/event-stream`，PCM 在 `speech.audio.delta` 的 base64 `audio` 字段里，并带 `sample_rate`。`stream=false` 才是裸 `audio/pcm`，采样率可能在 `X-Audio-Sample-Rate`。两种都按块解码后立即播放，不会先攒完整段回答。
+识别采样率固定 16000。录音处理脚本是独立文件，避免生产压缩把函数改名后采集模块调用失败、出现 0 帧。合成采样率不要假定与识别相同。`stream=true` 时上游返回 `text/event-stream`，PCM 在 `speech.audio.delta` 的 base64 `audio` 字段里，并带 `sample_rate`。`stream=false` 才是裸 `audio/pcm`。两种都按块解码后立即播放。
+
+说话过程中，只要上游发来 `transcription.delta`，文字会马上显示，不必等「说完了」。停顿约 0.9 秒，或手动点「说完了」，才会结束这一句并最多发起一次回答。vLLM 在识别已经开始后会忽略再次 `commit`，因此不能靠周期提交造出增量。若部署只在最终 `commit` 之后才出字，那就不是边说边出的真流式。可用：
+
+```bash
+cd backend && python scripts/probe_realtime_partials.py
+```
+
+退出码 2 表示结束之后才有字。本环境连不上 `120.48.180.39`，所以这里没有测到该主机停录前的 partial。
 
 ## 本地启动
 

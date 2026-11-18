@@ -7,9 +7,12 @@ _LANG_PREFIX = re.compile(r"^\s*language\s+[A-Za-z_-]+\s*", re.IGNORECASE)
 
 
 def visible_transcript(raw: str) -> str:
-    """去掉 Qwen 实时输出里的 language/<asr_text> 包装。没有包装时原样返回。"""
+    """去掉 Qwen 实时输出里的 language/<asr_text> 包装。包装还没写完时不把前缀显示出来。"""
 
-    if "<asr_text>" not in raw.lower():
+    lowered = raw.lower()
+    if "<asr_text>" not in lowered:
+        if re.match(r"^\s*language\b", raw, re.IGNORECASE):
+            return ""
         return _LANG_PREFIX.sub("", raw).strip()
     parts = [match.group(1).strip() for match in _ASR_TEXT.finditer(raw)]
     parts = [part for part in parts if part]

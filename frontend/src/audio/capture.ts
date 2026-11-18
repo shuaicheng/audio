@@ -64,6 +64,7 @@ export function micErrorMessage(error: unknown): string {
 export async function startCapture(hooks: {
   onFrame: (frame: ArrayBuffer) => void
   onStats?: (stats: CaptureStats) => void
+  onError?: (message: string) => void
 }): Promise<() => Promise<void>> {
   const blocked = microphoneBlockReason(window.isSecureContext, !!navigator.mediaDevices?.getUserMedia)
   if (blocked) throw new DOMException(blocked, "SecurityError")
@@ -75,10 +76,21 @@ export async function startCapture(hooks: {
   })
   await resumeOrThrow(context)
   const url = workletModuleUrl()
-  await context.audioWorklet.addModule(url)
+  try {
+    await context.audioWorklet.addModule(url)
+  } catch (error) {
+    URL.revokeObjectURL(url)
+    stream.getTracks().forEach((track) => track.stop())
+    await context.close()
+    const detail = error instanceof Error ? error.message : ""
+    throw new DOMException(detail ? `录音模块没有加载：${detail}` : "录音模块没有加载。", "InvalidStateError")
+  }
   URL.revokeObjectURL(url)
   const source = context.createMediaStreamSource(stream)
   const node = new AudioWorkletNode(context, "pcm-capture")
+  node.onprocessorerror = () => {
+    hooks.onError?.("录音处理模块出错，浏览器没有交出采样。")
+  }
   const silent = context.createGain()
   silent.gain.value = 0
   let pending = new Int16Array(0)
@@ -105,9 +117,18 @@ export async function startCapture(hooks: {
     hooks.onStats?.({ frames, samples, level: 0, contextState: context.state })
     hooks.onFrame(frame)
   }
-  node.port.onmessage = (event: MessageEvent<ArrayBuffer>) => {
+  node.port.onmessage = (event: MessageEvent<ArrayBuffer | { type?: string; message?: string; sampleRate?: number }>) => {
     if (closed) return
-    const chunk = new Int16Array(event.data)
+    const payload = event.data
+    if (!(payload instanceof ArrayBuffer)) {
+      if (payload && payload.type === "error") hooks.onError?.(payload.message || "录音处理模块出错。")
+      if (payload && payload.type === "ready") {
+        const rate = "sampleRate" in payload && typeof payload.sampleRate === "number" ? payload.sampleRate : 0
+        hooks.onStats?.({ frames, samples, level: 0, contextState: rate ? `running@${rate}` : "running" })
+      }
+      return
+    }
+    const chunk = new Int16Array(payload)
     publish(chunk)
     const merged = new Int16Array(pending.length + chunk.length)
     merged.set(pending, 0)
@@ -118,6 +139,7 @@ export async function startCapture(hooks: {
   source.connect(node)
   node.connect(silent)
   silent.connect(context.destination)
+  await resumeOrThrow(context)
   hooks.onStats?.({ frames, samples, level: 0, contextState: context.state })
   return async () => {
     closed = true

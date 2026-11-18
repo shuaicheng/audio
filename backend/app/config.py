@@ -74,6 +74,10 @@ class Settings(BaseSettings):
     outgoing_queue_chunks: int = 32
     history_max_turns: int = 16
     mock_token_delay_sec: float = 0.02
+    endpoint_enabled: bool = True
+    endpoint_silence_ms: int = 900
+    endpoint_min_speech_ms: int = 300
+    endpoint_speech_rms: float = 0.018
 
     secrets_fingerprint: str = Field(default="", exclude=True)
 

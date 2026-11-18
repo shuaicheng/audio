@@ -30,11 +30,14 @@ describe("resample", () => {
     expect(floatToInt16(new Float32Array([1]))[0]).toBe(32767)
   })
 
-  it("embeds the same resampler into the audio worklet", () => {
+  it("ships a self-contained worklet whose calls match its declarations", () => {
     const source = buildWorkletSource()
     expect(source).toContain('registerProcessor("pcm-capture"')
-    expect(source).toContain("function resampleBlock")
-    expect(source).toContain("16000")
+    for (const name of ["downmix", "resampleBlock", "floatToInt16"]) {
+      expect(source).toContain(`function ${name}`)
+      expect(source).toContain(`${name}(`)
+    }
+    expect(source).not.toContain("${")
   })
 })
 

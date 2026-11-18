@@ -8,6 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from app.config import Settings
+from app.endpoint import UtteranceEndpoint
 from app.ids import new_id
 from app.llm import LlmError
 from app.playback_gate import PlaybackGate
@@ -65,10 +66,7 @@ class Orchestrator:
         if demo:
             note = "当前是离线演示，不是线上模型结果。交付时没有对部署地址做过真实调用。"
         elif provider == "realtime":
-            note = (
-                "尚未对部署中的识别服务完成线上验证。开口时会按 vLLM Realtime 协议做模型握手；"
-                "若服务端拒绝，会返回 asr.unsupported，不会假装识别成功。"
-            )
+            note = "说话时就会显示识别。停顿或点「说完了」后才回答，播报时不会自动抢话。"
         elif provider == "qwen_streaming":
             note = "使用官方 qwen-asr 流式接口。它没有词级时间戳。本仓库不把文件重传当作流式。"
         else:
@@ -103,6 +101,8 @@ class Orchestrator:
             return
         kind = message.get("type")
         if kind == "speech.start":
+            if "auto_submit" in message:
+                self.auto_submit = message.get("auto_submit") is not False
             await self.start_speech()
         elif kind == "speech.finish":
             await self.finish_speech(auto_submit=message.get("auto_submit", True) is not False)
@@ -152,6 +152,14 @@ class Orchestrator:
             return
         self.utterance_bytes += len(pcm)
         self.audio_q.put_nowait((seq, pcm))
+        if (
+            self.settings.endpoint_enabled
+            and self.phase == "listening"
+            and not self._auto_finish_started
+            and self.endpoint.feed(pcm)
+        ):
+            self._auto_finish_started = True
+            self._track(asyncio.create_task(self.finish_speech(auto_submit=self.auto_submit)))
 
     async def start_speech(self) -> None:
         if self.closed:
@@ -164,6 +172,13 @@ class Orchestrator:
         self.asr = self.asr_factory()
         self.utterance_id = new_id("utt")
         self.utterance_bytes = 0
+        self._auto_finish_started = False
+        self.endpoint = UtteranceEndpoint(
+            self.settings.asr_sample_rate,
+            speech_rms=self.settings.endpoint_speech_rms,
+            silence_ms=self.settings.endpoint_silence_ms,
+            min_speech_ms=self.settings.endpoint_min_speech_ms,
+        )
         self.audio_q = asyncio.Queue(maxsize=max(1, self.settings.max_audio_pending_chunks))
         await self.asr.start()
         if not getattr(self.asr, "accepted", False):
@@ -192,7 +207,7 @@ class Orchestrator:
         await self.emit_state()
         if self.audio_q is not None:
             await self.audio_q.put(None)
-        if self.audio_task is not None:
+        if self.audio_task is not None and self.audio_task is not asyncio.current_task():
             with contextlib.suppress(asyncio.CancelledError):
                 await self.audio_task
         if self.asr is not None:

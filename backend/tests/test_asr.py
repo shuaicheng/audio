@@ -19,6 +19,8 @@ def test_transcript_revision_rules():
     assert merge_hypothesis("你好", "你好世界") == "你好世界"
     assert visible_transcript("language Chinese<asr_text>今天天气不错") == "今天天气不错"
     assert visible_transcript("language English<asr_text>Hello.language English<asr_text>World") == "Hello.World"
+    assert visible_transcript("language Chi") == ""
+    assert visible_transcript("你好") == "你好"
 
 
 async def _serve(handler):
@@ -71,6 +73,39 @@ async def test_realtime_handshake_append_and_replace(settings: Settings):
         assert kinds[1] == "input_audio_buffer.commit" and seen[1]["final"] is False
         assert "input_audio_buffer.append" in kinds
         assert kinds[-1] == "input_audio_buffer.commit" and seen[-1]["final"] is True
+    finally:
+        await engine.close()
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_realtime_partial_before_finish_and_hides_language_prefix(settings: Settings):
+    async def handler(ws):
+        await ws.send(json.dumps({"type": "session.created", "id": "sess-partial"}))
+        async for raw in ws:
+            event = json.loads(raw)
+            if event["type"] == "input_audio_buffer.append":
+                await ws.send(json.dumps({"type": "transcription.delta", "delta": "language "}))
+                await ws.send(json.dumps({"type": "transcription.delta", "delta": "Chinese<asr_text>你好"}))
+            elif event["type"] == "input_audio_buffer.commit" and event.get("final") is True:
+                await ws.send(json.dumps({"type": "transcription.done", "text": "language Chinese<asr_text>你好"}))
+                return
+
+    server, port = await _serve(handler)
+    engine = RealtimeAsrEngine(settings, url=f"ws://127.0.0.1:{port}")
+    try:
+        await engine.start()
+        assert (await engine.next_event(1)).kind == "ready"
+        await engine.push_audio(b"\x01\x00" * 160, 1)
+        partial = await engine.next_event(1)
+        assert engine._finish_sent is False
+        assert partial is not None and partial.kind == "partial"
+        assert partial.text == "你好"
+        assert "language" not in partial.text
+        await engine.finish()
+        final = await engine.next_event(1)
+        assert final is not None and final.kind == "final" and final.text == "你好"
     finally:
         await engine.close()
         server.close()
