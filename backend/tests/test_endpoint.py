@@ -133,3 +133,43 @@ async def test_speech_then_endpoint_asks_once(settings):
     assert asr.finished is True
     assert llm.calls == 1
     await orch.close()
+
+
+@pytest.mark.asyncio
+async def test_manual_finish_racing_endpoint_submits_the_first_final_once(settings):
+    settings.max_audio_pending_chunks = 200
+    clock = {"t": 0.0}
+    asr = ScriptedAsr()
+    commits = 0
+
+    async def final_text() -> None:
+        nonlocal commits
+        commits += 1
+        await asr.queue.put(AsrEvent(kind="final", text="一二三。"))
+        await asr.queue.put(AsrEvent(kind="final", text="一二三。一二三。"))
+
+    asr.finish = final_text
+    llm = ScriptLlm(["好。"])
+    orch = Orchestrator(settings, lambda: asr, llm, RecordingTts())
+    await orch.start_speech()
+    orch.endpoint.clock = lambda: clock["t"]
+    seq = 1
+    for stamp in (0.0, 0.5):
+        clock["t"] = stamp
+        await orch.handle_audio(encode_upstream_frame(seq, 16000, _pcm(12000, 100)))
+        seq += 1
+    clock["t"] = 0.9
+    await orch.handle_audio(encode_upstream_frame(seq, 16000, _pcm(0, 100)))
+    seq += 1
+    clock["t"] = 2.4
+    await orch.handle_audio(encode_upstream_frame(seq, 16000, _pcm(0, 100)))
+    await orch.finish_speech()
+    await orch.handle_text('{"type":"speech.finish","auto_submit":true}')
+    for _ in range(20):
+        if llm.calls:
+            break
+        await asyncio.sleep(0.05)
+    assert commits == 1
+    assert llm.calls == 1
+    assert llm.messages[0][-1]["content"] == "一二三。"
+    await orch.close()

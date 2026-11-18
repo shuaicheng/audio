@@ -22,7 +22,10 @@ def visible_transcript(raw: str) -> str:
 
 
 def merge_hypothesis(previous: str, delta: str) -> str:
-    """vLLM 的 transcription.delta 是增量。若服务把全文又放进 delta，则改为替换。"""
+    """把一条 transcription.delta 并进当前假设。
+
+    增量片段直接接上。若这条 delta 本身就是从开头重写的全文，则替换，不能再接一次。
+    """
 
     if not delta:
         return previous
@@ -31,3 +34,19 @@ def merge_hypothesis(previous: str, delta: str) -> str:
     if delta.startswith(previous):
         return delta
     return previous + delta
+
+
+def resolve_completed_transcript(merged: str, raw_deltas: list[str], done_text: str) -> str:
+    """决定 transcription.done 之后该提交哪一稿。
+
+    vLLM 的 done.text 就是把每条 delta 原文顺序拼起来。delta 若是增量，拼起来等于已经合并的假设，
+    done 就是这一句的完整稿。delta 若是一次次重写的全文，拼起来会把同一句再接一遍；
+    那不是新的权威稿，提交时仍用合并后的假设。done 文本和原文拼接不同时，才用它替换。
+    """
+
+    joined = "".join(raw_deltas)
+    if not done_text:
+        return merged
+    if done_text == joined and joined != merged:
+        return merged
+    return done_text

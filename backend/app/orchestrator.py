@@ -60,6 +60,7 @@ class Orchestrator:
         self._rx_frames = 0
         self._rx_samples = 0
         self._rx_peak = 0.0
+        self._submitted_utterance = ""
         self.gate = PlaybackGate(settings.playback_max_inflight_bytes)
         self.closed = False
         self._tasks: set[asyncio.Task] = set()
@@ -193,6 +194,7 @@ class Orchestrator:
         self._rx_frames = 0
         self._rx_samples = 0
         self._rx_peak = 0.0
+        self._submitted_utterance = ""
         self.endpoint = UtteranceEndpoint(
             self.settings.asr_sample_rate,
             onset_rms=self.settings.endpoint_onset_rms,
@@ -393,7 +395,10 @@ class Orchestrator:
                         }
                     )
                 elif event.kind == "final":
+                    if self.utterance_id and self.utterance_id == self._submitted_utterance:
+                        break
                     text = event.text.strip()
+                    self._submitted_utterance = self.utterance_id
                     await self.emit(
                         {
                             "type": "asr.final",

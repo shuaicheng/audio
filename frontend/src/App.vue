@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from "vue"
-import { formatLevel, micErrorMessage, microphoneBlockReason, startCapture, type CaptureStats } from "./audio/capture"
+import { formatLevel, micErrorMessage, microphoneBlockReason, nextSilenceHint, startCapture, type CaptureStats } from "./audio/capture"
 import { PcmPlayer } from "./audio/playback"
 import { AudioSendGate } from "./audio/sendGate"
 import { VoiceSocket, type ServerEvent } from "./net/session"
@@ -45,6 +45,7 @@ let socket: VoiceSocket | null = null
 let stopMic: (() => Promise<void>) | null = null
 let sendGate: AudioSendGate | null = null
 let seqGuard = 0
+let sealedUtterance = ""
 let asrReady = false
 let asrFailedMessage = ""
 let readyWaiters: Array<() => void> = []
@@ -99,16 +100,20 @@ function onEvent(event: ServerEvent) {
   } else if (type === "audio.progress") {
     receivedSamples.value = Number(event.samples || 0)
     receivedPeakText.value = formatLevel(Number(event.peak || 0))
-    if (receivedSamples.value > 16000 && Number(event.peak || 0) < 0.008) {
-      silenceHint.value = "服务端收到的声音一直很小。请检查是否选错麦克风，或系统是否把麦克风静音了。"
-    }
+    silenceHint.value = nextSilenceHint(silenceHint.value, "server", receivedSamples.value, Number(event.peak || 0))
   } else if (type === "asr.partial" || type === "asr.final") {
+    const utterance = String(event.utterance_id || "")
+    if (utterance && utterance === sealedUtterance) return
     const text = String(event.text || "")
     if (text) draft.value = text
-    if (type === "asr.final" && event.awaiting_edit) composer.value = text
-    if (type === "asr.final") micStatus.value = text ? "这句话已结束" : "没有识别到内容"
+    if (type === "asr.final") {
+      if (utterance) sealedUtterance = utterance
+      if (event.awaiting_edit) composer.value = text
+      micStatus.value = text ? "这句话已结束" : "没有识别到内容"
+    }
   } else if (type === "turn.started") {
     const id = `user-${event.turn_id}`
+    if (messages.value.some((item) => item.id === id)) return
     messages.value.push({ id, role: "user", text: String(event.text || ""), status: "complete" })
     micStatus.value = "这句话已放入对话"
     answering.value = true
@@ -151,6 +156,7 @@ function resetCaptureWait() {
   receivedPeakText.value = "0.0"
   captureState.value = ""
   silenceHint.value = ""
+  sealedUtterance = ""
   draft.value = ""
   micStatus.value = "正在打开麦克风"
 }
@@ -232,10 +238,9 @@ async function beginSpeech() {
         sampleCount.value = stats.samples
         levelText.value = formatLevel(stats.level)
         const previousPeak = Number(peakText.value) / 100
+        const peak = Math.max(stats.level, previousPeak)
         if (stats.level >= previousPeak) peakText.value = formatLevel(stats.level)
-        if (sampleCount.value > 16000 && Number(peakText.value) < 0.8) {
-          silenceHint.value = "采集电平一直很低。请换一个麦克风，或检查系统有没有把麦克风静音。"
-        }
+        silenceHint.value = nextSilenceHint(silenceHint.value, "mic", sampleCount.value, peak)
       },
     })
     await playbackReady

@@ -27,6 +27,16 @@ export function formatLevel(rms: number): string {
   return String(Math.round(percent))
 }
 
+const MIC_SILENCE_HINT = "采集电平一直很低。请换一个麦克风，或检查系统有没有把麦克风静音。"
+const SERVER_SILENCE_HINT = "服务端收到的声音一直很小。请检查是否选错麦克风，或系统是否把麦克风静音了。"
+
+export function nextSilenceHint(current: string, source: "mic" | "server", samples: number, rms: number): string {
+  const message = source === "mic" ? MIC_SILENCE_HINT : SERVER_SILENCE_HINT
+  if (samples > 16000 && rms < 0.008) return message
+  if (current === message && rms >= 0.008) return ""
+  return current
+}
+
 export function pcmLevel(pcm: Int16Array): number {
   if (pcm.length === 0) return 0
   let sum = 0

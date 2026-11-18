@@ -9,7 +9,7 @@ import websockets
 
 from app.asr.degraded_file import DegradedFileAsr
 from app.asr.factory import build_asr
-from app.asr.normalize import merge_hypothesis, visible_transcript
+from app.asr.normalize import merge_hypothesis, resolve_completed_transcript, visible_transcript
 from app.asr.realtime import RealtimeAsrEngine
 from app.config import Settings
 
@@ -79,6 +79,17 @@ async def test_partial_survives_the_idle_gap_before_the_first_word(settings):
 def test_transcript_revision_rules():
     assert merge_hypothesis("你好", "世界") == "你好世界"
     assert merge_hypothesis("你好", "你好世界") == "你好世界"
+    once = "一二三四五六七八九。"
+    assert merge_hypothesis(once, once) == once
+    assert merge_hypothesis("你好", "你好你好") == "你好你好"
+    assert merge_hypothesis(merge_hypothesis(merge_hypothesis("你", "好"), "你"), "好") == "你好你好"
+    joined = once + once
+    assert resolve_completed_transcript(once, [once, once], joined) == once
+    assert resolve_completed_transcript("你好你好", ["你", "好", "你", "好"], "你好你好") == "你好你好"
+    assert resolve_completed_transcript("你好你好", ["你好", "你好你好"], "你好你好你好") == "你好你好"
+    wrapped = "language Chinese<asr_text>" + once
+    assert resolve_completed_transcript(wrapped, [wrapped], "language Chinese<asr_text>" + once) == wrapped
+    assert visible_transcript(resolve_completed_transcript(wrapped, [wrapped, wrapped], wrapped + wrapped)) == once
     assert visible_transcript("language Chinese<asr_text>今天天气不错") == "今天天气不错"
     assert visible_transcript("language English<asr_text>Hello.language English<asr_text>World") == "Hello.World"
     assert visible_transcript("language Chi") == ""
@@ -137,6 +148,63 @@ async def test_realtime_handshake_append_and_replace(settings: Settings):
         assert kinds[-1] == "input_audio_buffer.commit" and seen[-1]["final"] is True
     finally:
         await engine.close()
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_done_concatenation_does_not_double_one_sentence(settings: Settings):
+    """vLLM sets done.text to the raw join of deltas. A repeated full-hypothesis delta must not be submitted twice."""
+    once = "一二三四五六七八九。"
+    trace: list[str] = []
+
+    async def handler(ws):
+        await ws.send(json.dumps({"type": "session.created", "id": "sess-once"}))
+        async for raw in ws:
+            event = json.loads(raw)
+            trace.append(event["type"] + (":final" if event.get("final") is True else ""))
+            if event["type"] == "input_audio_buffer.append":
+                trace.append("upstream.delta")
+                await ws.send(json.dumps({"type": "transcription.delta", "delta": once}))
+            elif event["type"] == "input_audio_buffer.commit" and event.get("final") is True:
+                trace.append("upstream.delta")
+                await ws.send(json.dumps({"type": "transcription.delta", "delta": once}))
+                trace.append("upstream.done")
+                await ws.send(json.dumps({"type": "transcription.done", "text": once + once}))
+                await ws.send(json.dumps({"type": "transcription.done", "text": once + once + once}))
+                return
+
+    server, port = await _serve(handler)
+    settings.asr_error_probe_sec = 0.05
+    from app.orchestrator import Orchestrator
+    from app.protocol import encode_upstream_frame
+    from tests.conftest import collect
+    from tests.fakes import RecordingTts, ScriptLlm
+
+    llm = ScriptLlm(["好。"])
+    engine = RealtimeAsrEngine(settings, url=f"ws://127.0.0.1:{port}")
+    orch = Orchestrator(settings, lambda: engine, llm, RecordingTts())
+    try:
+        await orch.start_speech()
+        await orch.handle_audio(encode_upstream_frame(1, 16000, b"\x01\x00" * 1600))
+        live, _ = await collect(orch, 0.6)
+        partials = [event["text"] for event in live if event["type"] == "asr.partial"]
+        assert partials == [once]
+        assert not any(event["type"] == "turn.started" for event in live)
+        await orch.finish_speech()
+        await orch.finish_speech()
+        finished, _ = await collect(orch, 0.6)
+        finals = [event["text"] for event in finished if event["type"] == "asr.final"]
+        turns = [event["text"] for event in finished if event["type"] == "turn.started"]
+        assert finals == [once]
+        assert turns == [once]
+        assert llm.calls == 1
+        assert llm.messages[0][-1]["content"] == once
+        assert trace.count("input_audio_buffer.append") == 1
+        assert trace.count("input_audio_buffer.commit:final") == 1
+        assert "upstream.done" in trace
+    finally:
+        await orch.close()
         server.close()
         await server.wait_closed()
 

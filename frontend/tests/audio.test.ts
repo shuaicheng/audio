@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { formatLevel, microphoneBlockReason, pcmLevel, resumeOrThrow } from "../src/audio/capture"
+import { formatLevel, microphoneBlockReason, nextSilenceHint, pcmLevel, resumeOrThrow } from "../src/audio/capture"
 import { AudioSendGate } from "../src/audio/sendGate"
 import { alignedFrameCount, bufferDuration, nextStartTime } from "../src/audio/playback"
 import { createResampleState, downmix, floatToInt16, resampleBlock } from "../src/audio/resample"
@@ -52,6 +52,14 @@ describe("playback alignment", () => {
 })
 
 describe("microphone startup", () => {
+  it("clears a quiet-mic warning after the held peak shows sound", () => {
+    const quiet = nextSilenceHint("", "mic", 20000, 0.001)
+    expect(quiet).toContain("麦克风")
+    expect(nextSilenceHint(quiet, "mic", 30000, 0.14)).toBe("")
+    expect(nextSilenceHint(quiet, "server", 30000, 0.14)).toBe(quiet)
+    expect(nextSilenceHint("", "server", 20000, 0.073)).toBe("")
+  })
+
   it("explains insecure context and suspended capture", async () => {
     expect(microphoneBlockReason(false, true)).toContain("HTTPS")
     expect(microphoneBlockReason(true, false)).toContain("麦克风")

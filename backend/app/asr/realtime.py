@@ -9,7 +9,7 @@ from typing import Any
 import websockets
 
 from app.asr.base import AsrEvent
-from app.asr.normalize import merge_hypothesis, visible_transcript
+from app.asr.normalize import merge_hypothesis, resolve_completed_transcript, visible_transcript
 from app.config import Settings
 
 logger = logging.getLogger(__name__)
@@ -41,6 +41,7 @@ class RealtimeAsrEngine:
         self._started = False
         self._finish_sent = False
         self._hypothesis = ""
+        self._raw_deltas: list[str] = []
         self._next_seq = 1
         self._got_terminal = False
         self.accepted = False
@@ -183,16 +184,21 @@ class RealtimeAsrEngine:
     async def _apply(self, event: dict) -> None:
         kind = event.get("type")
         if kind == "transcription.delta":
-            if isinstance(event.get("text"), str):
+            if "delta" in event:
+                piece = str(event.get("delta") or "")
+                if piece:
+                    self._raw_deltas.append(piece)
+                    self._hypothesis = merge_hypothesis(self._hypothesis, piece)
+            elif isinstance(event.get("text"), str):
                 self._hypothesis = str(event["text"])
-            else:
-                self._hypothesis = merge_hypothesis(self._hypothesis, str(event.get("delta") or ""))
+                self._raw_deltas = [self._hypothesis]
             await self._publish_partial()
             return
         if kind == "transcription.done":
-            text = event.get("text")
-            if isinstance(text, str) and text:
-                self._hypothesis = text
+            if self._got_terminal:
+                return
+            done_text = event.get("text") if isinstance(event.get("text"), str) else ""
+            self._hypothesis = resolve_completed_transcript(self._hypothesis, self._raw_deltas, done_text)
             visible = visible_transcript(self._hypothesis)
             self._last_visible = visible
             if self._finish_sent:
