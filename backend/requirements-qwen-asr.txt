@@ -1,0 +1,10 @@
+# 可选、隔离安装。不要和 API 服务的依赖混在同一个必装环境里。
+# 建议：
+#   python -m venv /opt/qwen-asr-venv
+#   /opt/qwen-asr-venv/bin/pip install -r requirements-qwen-asr.txt
+#   QWEN_ASR_WORKER_PYTHON=/opt/qwen-asr-venv/bin/python
+#
+# 流式接口只支持 vLLM 后端，且没有词级时间戳。见：
+# https://github.com/QwenLM/Qwen3-ASR/blob/main/examples/example_qwen3_asr_vllm_streaming.py
+qwen-asr[vllm]
+numpy

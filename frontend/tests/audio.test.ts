@@ -1,0 +1,79 @@
+import { describe, expect, it } from "vitest"
+import { alignedFrameCount, bufferDuration, nextStartTime } from "../src/audio/playback"
+import { createResampleState, downmix, floatToInt16, resampleBlock } from "../src/audio/resample"
+import { buildWorkletSource } from "../src/audio/worklet"
+import { decodeDownstream, encodeUpstream } from "../src/net/protocol"
+
+describe("resample", () => {
+  it("converts a constant 48 kHz signal to 16 kHz pcm16", () => {
+    const input = new Float32Array(48000)
+    input.fill(0.25)
+    const state = createResampleState()
+    const output = resampleBlock(input, 48000, 16000, state)
+    expect(output.length).toBeGreaterThan(15800)
+    expect(output.length).toBeLessThanOrEqual(16000)
+    expect(output[100]).toBeGreaterThan(7000)
+    expect(output[100]).toBeLessThan(9000)
+  })
+
+  it("keeps the same rate as real pcm16 conversion", () => {
+    const input = new Float32Array([0, 0.5, -1])
+    const output = resampleBlock(input, 16000, 16000, createResampleState())
+    expect(Array.from(output)).toEqual([0, 16384, -32767])
+  })
+
+  it("downmixes stereo before resampling", () => {
+    const mono = downmix([new Float32Array([0, 1]), new Float32Array([1, 1])])
+    expect(Array.from(mono)).toEqual([0.5, 1])
+    expect(floatToInt16(new Float32Array([1]))[0]).toBe(32767)
+  })
+
+  it("embeds the same resampler into the audio worklet", () => {
+    const source = buildWorkletSource()
+    expect(source).toContain('registerProcessor("pcm-capture"')
+    expect(source).toContain("function resampleBlock")
+    expect(source).toContain("16000")
+  })
+})
+
+describe("playback alignment", () => {
+  it("aligns start time and drops partial frames", () => {
+    expect(nextStartTime(10, 9.5)).toBeCloseTo(10.03)
+    expect(nextStartTime(10, 12)).toBe(12)
+    expect(alignedFrameCount(5, 1)).toBe(2)
+    expect(bufferDuration(24000, 24000)).toBe(1)
+    expect(bufferDuration(16000, 24000)).toBeCloseTo(16000 / 24000)
+  })
+})
+
+describe("binary frames", () => {
+  it("roundtrips upstream audio and downstream metadata", () => {
+    const pcm = new Int16Array([1, -2, 3])
+    const encoded = encodeUpstream(4, 16000, pcm)
+    const bytes = new Uint8Array(encoded)
+    expect(String.fromCharCode(...bytes.slice(0, 4))).toBe("AUPC")
+    const view = new DataView(encoded)
+    expect(view.getUint32(6, true)).toBe(4)
+    expect(view.getUint32(10, true)).toBe(16000)
+    const header = new Uint8Array([
+      0x41, 0x44, 0x4e, 0x41, 1, 1, 8,
+      ..."turn_abc".split("").map((char) => char.charCodeAt(0)),
+    ])
+    const rest = new DataView(new ArrayBuffer(12))
+    rest.setUint16(0, 3, true)
+    rest.setUint32(2, 9, true)
+    rest.setUint32(6, 22050, true)
+    rest.setUint16(10, 1, true)
+    const payload = new Uint8Array(pcm.buffer)
+    const frame = new Uint8Array(header.length + 12 + payload.byteLength)
+    frame.set(header, 0)
+    frame.set(new Uint8Array(rest.buffer), header.length)
+    frame.set(payload, header.length + 12)
+    const decoded = decodeDownstream(frame.buffer)
+    expect(decoded?.turnId).toBe("turn_abc")
+    expect(decoded?.sampleRate).toBe(22050)
+    expect(decoded?.segmentIndex).toBe(3)
+    expect(decoded?.chunkIndex).toBe(9)
+    expect(Array.from(decoded?.pcm ?? [])).toEqual([1, -2, 3])
+  })
+})
