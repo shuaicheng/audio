@@ -79,6 +79,7 @@ class Settings(BaseSettings):
     endpoint_silence_ms: int = 1400
     endpoint_onset_rms: float = 0.05
     endpoint_release_rms: float = 0.02
+    asr_silence_tail_ms: int = 350
 
     secrets_fingerprint: str = Field(default="", exclude=True)
 

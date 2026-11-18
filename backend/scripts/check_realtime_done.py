@@ -22,6 +22,7 @@ import wave
 
 import websockets
 
+from app.asr.forward import AsrForwardGate
 from app.asr.normalize import merge_hypothesis, resolve_completed_transcript, visible_transcript
 
 
@@ -48,17 +49,61 @@ def _synthesize(text: str) -> str:
 
 async def _run(url: str, model: str, pcm: bytes) -> int:
     deltas: list[str] = []
+    delta_at: list[float] = []
     done_text = ""
     sequence: list[str] = []
     started = time.monotonic()
+    first_append_at = 0.0
+    gate = AsrForwardGate(16000, release_rms=0.02, tail_ms=350)
+    forwarded = 0
+    held = 0
     async with websockets.connect(url, open_timeout=8) as ws:
         sequence.append(f"{time.monotonic() - started:.2f}s session.wait")
         created = json.loads(await asyncio.wait_for(ws.recv(), 8))
         sequence.append(f"{time.monotonic() - started:.2f}s {created.get('type')}")
         await ws.send(json.dumps({"type": "session.update", "model": model}))
         await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": False}))
-        for offset in range(0, len(pcm), 3200):
-            piece = pcm[offset : offset + 3200]
+        finished = asyncio.Event()
+
+        async def read_events() -> None:
+            nonlocal done_text
+            while not finished.is_set():
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), 20)
+                except TimeoutError:
+                    sequence.append("timeout waiting for done")
+                    finished.set()
+                    return
+                event = json.loads(raw)
+                kind = str(event.get("type") or "")
+                if kind == "transcription.delta":
+                    deltas.append(str(event.get("delta") or ""))
+                    delta_at.append(time.monotonic())
+                    since_audio = 0.0 if first_append_at == 0 else delta_at[-1] - first_append_at
+                    gap = 0.0 if len(delta_at) == 1 else delta_at[-1] - delta_at[-2]
+                    sequence.append(
+                        f"{time.monotonic() - started:.2f}s delta chars={len(deltas[-1])} since_first_append={since_audio:.2f}s gap={gap:.2f}s"
+                    )
+                elif kind == "transcription.done":
+                    done_text = str(event.get("text") or "")
+                    sequence.append(f"{time.monotonic() - started:.2f}s done chars={len(done_text)}")
+                    finished.set()
+                    return
+                else:
+                    sequence.append(f"{time.monotonic() - started:.2f}s {kind}")
+
+        reader = asyncio.create_task(read_events())
+        for offset in range(0, len(pcm), 1600):
+            piece = pcm[offset : offset + 1600]
+            take = gate.wants(piece)
+            gate.commit(piece, take)
+            if not take:
+                held += len(piece) // 2
+                await asyncio.sleep(0.1)
+                continue
+            forwarded += len(piece) // 2
+            if first_append_at == 0.0:
+                first_append_at = time.monotonic()
             await ws.send(
                 json.dumps(
                     {
@@ -69,24 +114,11 @@ async def _run(url: str, model: str, pcm: bytes) -> int:
             )
             await asyncio.sleep(0.1)
         await ws.send(json.dumps({"type": "input_audio_buffer.commit", "final": True}))
-        sequence.append(f"{time.monotonic() - started:.2f}s commit.final bytes={len(pcm)}")
-        while True:
-            try:
-                raw = await asyncio.wait_for(ws.recv(), 20)
-            except TimeoutError:
-                sequence.append("timeout waiting for done")
-                break
-            event = json.loads(raw)
-            kind = str(event.get("type") or "")
-            if kind == "transcription.delta":
-                deltas.append(str(event.get("delta") or ""))
-                sequence.append(f"{time.monotonic() - started:.2f}s delta chars={len(deltas[-1])}")
-            elif kind == "transcription.done":
-                done_text = str(event.get("text") or "")
-                sequence.append(f"{time.monotonic() - started:.2f}s done chars={len(done_text)}")
-                break
-            else:
-                sequence.append(f"{time.monotonic() - started:.2f}s {kind}")
+        sequence.append(
+            f"{time.monotonic() - started:.2f}s commit.final forwarded_samples={forwarded} held_silence_samples={held}"
+        )
+        await finished.wait()
+        reader.cancel()
     merged = ""
     for piece in deltas:
         merged = merge_hypothesis(merged, piece)
@@ -95,6 +127,14 @@ async def _run(url: str, model: str, pcm: bytes) -> int:
     print("sequence:")
     for line in sequence:
         print(" ", line)
+    if delta_at and first_append_at:
+        print(f"first_delta_after_append_sec={delta_at[0] - first_append_at:.2f}")
+        if len(delta_at) > 1:
+            gaps = [round(delta_at[index] - delta_at[index - 1], 2) for index in range(1, len(delta_at))]
+            print(f"delta_gaps_sec={gaps}")
+    print(f"chunk_samples=1600 chunk_ms=100 forwarded_samples={forwarded} held_silence_samples={held}")
+    print("client_render=整段替换，无逐字动画。文件分片转写未使用。")
+    print("server_limit=首段延迟由识别服务分段决定；session.update 只能带模型名，客户端不能改分段时长。")
     print(f"delta_count={len(deltas)}")
     print(f"joined_chars={len(joined)} merged_chars={len(visible_transcript(merged))} done_chars={len(done_text)}")
     print(f"done_equals_raw_join={done_text == joined}")

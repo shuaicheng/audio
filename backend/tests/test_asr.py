@@ -358,3 +358,227 @@ async def test_degraded_file_is_opt_in_and_labeled(settings: Settings):
     assert len(calls[-1]) > len(calls[0])
     await engine.close()
     await client.aclose()
+
+
+def test_merge_cannot_invent_characters_that_no_delta_contains():
+    spoken = "一二三。四五六。七八九。"
+    assert "十" not in merge_hypothesis(spoken, spoken)
+    assert merge_hypothesis(spoken, spoken + "十十一十二。") == spoken + "十十一十二。"
+    assert merge_hypothesis(spoken, "十十一十二。") == spoken + "十十一十二。"
+    assert merge_hypothesis("你好", "你好你好") == "你好你好"
+    assert resolve_completed_transcript("你好你好", ["你", "好", "你", "好"], "你好你好") == "你好你好"
+
+
+def test_long_silence_after_speech_is_not_forwarded():
+    from app.asr.forward import AsrForwardGate
+
+    gate = AsrForwardGate(16000, release_rms=0.02, tail_ms=350)
+    loud = array_pcm(8000, 1600)
+    quiet = array_pcm(0, 1600)
+    assert gate.wants(quiet) is True
+    gate.commit(quiet, True)
+    assert gate.wants(loud) is True
+    gate.commit(loud, True)
+    forwarded = 0
+    held = 0
+    for _ in range(20):
+        take = gate.wants(quiet)
+        gate.commit(quiet, take)
+        if take:
+            forwarded += 1600
+        else:
+            held += 1600
+    assert forwarded <= 16000 * 0.35 + 1600
+    assert held > 16000
+
+
+def array_pcm(value: int, count: int) -> bytes:
+    import array
+
+    return array.array("h", [value] * count).tobytes()
+
+
+@pytest.mark.asyncio
+async def test_trailing_silence_cannot_pull_a_later_hypothesis(settings: Settings):
+    spoken = "一二三。四五六。七八九。"
+    extended = spoken + "十十一十二。"
+    seen = {"silence": 0, "speech": 0}
+
+    async def handler(ws):
+        await ws.send(json.dumps({"type": "session.created", "id": "sess-nine"}))
+        speech = False
+        async for raw in ws:
+            event = json.loads(raw)
+            if event["type"] == "input_audio_buffer.append":
+                pcm = base64.b64decode(event["audio"])
+                from app.endpoint import pcm_rms
+
+                if pcm_rms(pcm) >= 0.02:
+                    speech = True
+                    seen["speech"] += len(pcm) // 2
+                    await ws.send(json.dumps({"type": "transcription.delta", "delta": spoken}))
+                elif speech:
+                    seen["silence"] += len(pcm) // 2
+                    if seen["silence"] > 16000:
+                        await ws.send(json.dumps({"type": "transcription.delta", "delta": extended}))
+            elif event["type"] == "input_audio_buffer.commit" and event.get("final") is True:
+                await ws.send(json.dumps({"type": "transcription.done", "text": spoken}))
+                return
+
+    server, port = await _serve(handler)
+    settings.asr_error_probe_sec = 0.05
+    settings.asr_silence_tail_ms = 350
+    settings.max_audio_pending_chunks = 80
+    from app.orchestrator import Orchestrator
+    from app.protocol import encode_upstream_frame
+    from tests.conftest import collect
+    from tests.fakes import RecordingTts, ScriptLlm
+
+    llm = ScriptLlm(["好。"])
+    orch = Orchestrator(settings, lambda: RealtimeAsrEngine(settings, url=f"ws://127.0.0.1:{port}"), llm, RecordingTts())
+    try:
+        await orch.start_speech()
+        await orch.handle_audio(encode_upstream_frame(1, 16000, array_pcm(8000, 3200)))
+        for index in range(30):
+            await orch.handle_audio(encode_upstream_frame(index + 2, 16000, array_pcm(0, 1600)))
+        live, _ = await collect(orch, 0.4)
+        assert [event["text"] for event in live if event["type"] == "asr.partial"] == [spoken]
+        await orch.finish_speech()
+        finished, _ = await collect(orch, 0.5)
+        finals = [event["text"] for event in finished if event["type"] == "asr.final"]
+        turns = [event["text"] for event in finished if event["type"] == "turn.started"]
+        assert finals == [spoken]
+        assert turns == [spoken]
+        assert "十" not in turns[0]
+        assert llm.calls == 1
+        assert seen["silence"] < 16000
+        assert seen["speech"] > 0
+    finally:
+        await orch.close()
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_extension_present_in_a_speech_delta_is_kept(settings: Settings):
+    spoken = "一二三。四五六。七八九。"
+    extended = spoken + "十十一十二。"
+
+    async def handler(ws):
+        await ws.send(json.dumps({"type": "session.created", "id": "sess-keep"}))
+        async for raw in ws:
+            event = json.loads(raw)
+            if event["type"] == "input_audio_buffer.append":
+                await ws.send(json.dumps({"type": "transcription.delta", "delta": extended}))
+            elif event["type"] == "input_audio_buffer.commit" and event.get("final") is True:
+                await ws.send(json.dumps({"type": "transcription.done", "text": extended}))
+                return
+
+    server, port = await _serve(handler)
+    settings.asr_error_probe_sec = 0.05
+    settings.max_audio_pending_chunks = 20
+    from app.orchestrator import Orchestrator
+    from app.protocol import encode_upstream_frame
+    from tests.conftest import collect
+    from tests.fakes import RecordingTts, ScriptLlm
+
+    llm = ScriptLlm(["好。"])
+    orch = Orchestrator(settings, lambda: RealtimeAsrEngine(settings, url=f"ws://127.0.0.1:{port}"), llm, RecordingTts())
+    try:
+        await orch.handle_text(json.dumps({"type": "speech.start", "auto_submit": True, "review_growth": False}))
+        await orch.handle_audio(encode_upstream_frame(1, 16000, array_pcm(8000, 3200)))
+        await collect(orch, 0.3)
+        await orch.finish_speech()
+        finished, _ = await collect(orch, 0.5)
+        turns = [event["text"] for event in finished if event["type"] == "turn.started"]
+        assert turns == [extended]
+        assert llm.calls == 1
+    finally:
+        await orch.close()
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_growth_after_speech_can_wait_for_an_edit_without_deleting_it(settings: Settings):
+    spoken = "今天天气不错，我们出去走走。"
+    extended = spoken + "再往前走。"
+
+    async def handler(ws):
+        await ws.send(json.dumps({"type": "session.created", "id": "sess-review"}))
+        sent = False
+        async for raw in ws:
+            event = json.loads(raw)
+            if event["type"] == "input_audio_buffer.append" and not sent:
+                sent = True
+                await ws.send(json.dumps({"type": "transcription.delta", "delta": spoken}))
+            elif event["type"] == "input_audio_buffer.commit" and event.get("final") is True:
+                await ws.send(json.dumps({"type": "transcription.delta", "delta": extended}))
+                await ws.send(json.dumps({"type": "transcription.done", "text": spoken + extended}))
+                return
+
+    server, port = await _serve(handler)
+    settings.asr_error_probe_sec = 0.05
+    settings.max_audio_pending_chunks = 20
+    from app.orchestrator import Orchestrator
+    from app.protocol import encode_upstream_frame
+    from tests.conftest import collect
+    from tests.fakes import RecordingTts, ScriptLlm
+
+    llm = ScriptLlm(["不该自动出现"])
+    orch = Orchestrator(settings, lambda: RealtimeAsrEngine(settings, url=f"ws://127.0.0.1:{port}"), llm, RecordingTts())
+    try:
+        await orch.handle_text(json.dumps({"type": "speech.start", "auto_submit": True, "review_growth": True}))
+        await orch.handle_audio(encode_upstream_frame(1, 16000, array_pcm(8000, 3200)))
+        await collect(orch, 0.3)
+        await orch.handle_audio(encode_upstream_frame(2, 16000, array_pcm(0, 1600)))
+        await orch.finish_speech()
+        finished, _ = await collect(orch, 0.5)
+        final = next(event for event in finished if event["type"] == "asr.final")
+        assert final["text"] == extended
+        assert final["awaiting_edit"] is True
+        assert final["review_reason"] == "停口之后识别又变长了"
+        assert not any(event["type"] == "turn.started" for event in finished)
+        assert llm.calls == 0
+    finally:
+        await orch.close()
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_repeat_and_plain_sentence_pass_through_unchanged(settings: Settings):
+    async def handler(ws):
+        await ws.send(json.dumps({"type": "session.created", "id": "sess-repeat"}))
+        async for raw in ws:
+            event = json.loads(raw)
+            if event["type"] == "input_audio_buffer.append":
+                await ws.send(json.dumps({"type": "transcription.delta", "delta": "你"}))
+                await ws.send(json.dumps({"type": "transcription.delta", "delta": "好"}))
+                await ws.send(json.dumps({"type": "transcription.delta", "delta": "你"}))
+                await ws.send(json.dumps({"type": "transcription.delta", "delta": "好"}))
+            elif event["type"] == "input_audio_buffer.commit" and event.get("final") is True:
+                await ws.send(json.dumps({"type": "transcription.done", "text": "你好你好"}))
+                return
+
+    server, port = await _serve(handler)
+    settings.asr_error_probe_sec = 0.05
+    from app.orchestrator import Orchestrator
+    from app.protocol import encode_upstream_frame
+    from tests.conftest import collect
+    from tests.fakes import RecordingTts, ScriptLlm
+
+    llm = ScriptLlm(["在。"])
+    orch = Orchestrator(settings, lambda: RealtimeAsrEngine(settings, url=f"ws://127.0.0.1:{port}"), llm, RecordingTts())
+    try:
+        await orch.start_speech()
+        await orch.handle_audio(encode_upstream_frame(1, 16000, array_pcm(8000, 1600)))
+        await orch.finish_speech()
+        finished, _ = await collect(orch, 0.5)
+        turns = [event["text"] for event in finished if event["type"] == "turn.started"]
+        assert turns == ["你好你好"]
+        assert llm.calls == 1
+    finally:
+        await orch.close()
+        server.close()
+        await server.wait_closed()

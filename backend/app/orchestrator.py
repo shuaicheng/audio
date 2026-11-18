@@ -7,6 +7,7 @@ import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
+from app.asr.forward import AsrForwardGate
 from app.config import Settings
 from app.endpoint import UtteranceEndpoint, pcm_rms
 from app.ids import new_id
@@ -61,6 +62,9 @@ class Orchestrator:
         self._rx_samples = 0
         self._rx_peak = 0.0
         self._submitted_utterance = ""
+        self._asr_seq = 0
+        self._forward: AsrForwardGate | None = None
+        self.review_growth = False
         self.gate = PlaybackGate(settings.playback_max_inflight_bytes)
         self.closed = False
         self._tasks: set[asyncio.Task] = set()
@@ -109,8 +113,12 @@ class Orchestrator:
         if kind == "speech.start":
             if "auto_submit" in message:
                 self.auto_submit = message.get("auto_submit") is not False
+            if "review_growth" in message:
+                self.review_growth = message.get("review_growth") is True
             await self.start_speech()
         elif kind == "speech.finish":
+            if "review_growth" in message:
+                self.review_growth = message.get("review_growth") is True
             await self.finish_speech(auto_submit=message.get("auto_submit", True) is not False)
         elif kind == "speech.cancel":
             await self.cancel_speech()
@@ -146,7 +154,8 @@ class Orchestrator:
                 }
             )
             return
-        if self.audio_q.full():
+        forward = self._forward.wants(pcm) if self._forward is not None else True
+        if forward and self.audio_q.full():
             await self.emit(
                 {
                     "type": "queue.limit",
@@ -160,7 +169,11 @@ class Orchestrator:
         self._rx_frames += 1
         self._rx_samples += len(pcm) // 2
         self._rx_peak = max(self._rx_peak, pcm_rms(pcm))
-        self.audio_q.put_nowait((seq, pcm))
+        if self._forward is not None:
+            self._forward.commit(pcm, forward)
+        if forward:
+            self._asr_seq += 1
+            self.audio_q.put_nowait((self._asr_seq, pcm))
         if self._rx_frames == 1 or self._rx_frames % 8 == 0:
             await self.emit(
                 {
@@ -169,6 +182,8 @@ class Orchestrator:
                     "samples": self._rx_samples,
                     "peak": round(self._rx_peak, 4),
                     "stage": self.endpoint.stage if self.endpoint else "waiting",
+                    "forwarded_samples": self._forward.forwarded_samples if self._forward else self._rx_samples,
+                    "held_samples": self._forward.held_samples if self._forward else 0,
                 }
             )
         if self.settings.endpoint_enabled and self.phase == "listening":
@@ -195,6 +210,12 @@ class Orchestrator:
         self._rx_samples = 0
         self._rx_peak = 0.0
         self._submitted_utterance = ""
+        self._asr_seq = 0
+        self._forward = AsrForwardGate(
+            self.settings.asr_sample_rate,
+            self.settings.endpoint_release_rms,
+            self.settings.asr_silence_tail_ms,
+        )
         self.endpoint = UtteranceEndpoint(
             self.settings.asr_sample_rate,
             onset_rms=self.settings.endpoint_onset_rms,
@@ -383,6 +404,8 @@ class Orchestrator:
                     )
                 elif event.kind == "partial":
                     revision += 1
+                    if self._forward is not None:
+                        self._forward.note_text(event.text)
                     await self.emit(
                         {
                             "type": "asr.partial",
@@ -398,6 +421,9 @@ class Orchestrator:
                     if self.utterance_id and self.utterance_id == self._submitted_utterance:
                         break
                     text = event.text.strip()
+                    if self._forward is not None:
+                        self._forward.note_text(text)
+                    review = bool(self.review_growth and self._forward and self._forward.grew_without_voice)
                     self._submitted_utterance = self.utterance_id
                     await self.emit(
                         {
@@ -407,10 +433,11 @@ class Orchestrator:
                             "degraded": degraded,
                             "strategy": event.strategy,
                             "timestamps": False,
-                            "awaiting_edit": bool(text) and not self.auto_submit,
+                            "awaiting_edit": bool(text) and (not self.auto_submit or review),
+                            "review_reason": "停口之后识别又变长了" if review else "",
                         }
                     )
-                    if text and self.auto_submit:
+                    if text and self.auto_submit and not review:
                         await self._start_turn(text, source="speech", utterance_id=self.utterance_id)
                     elif text:
                         self.phase = "ready"

@@ -22,6 +22,9 @@ const demoLabel = ref("")
 const draft = ref("")
 const composer = ref("")
 const autoSend = ref(true)
+const reviewGrowth = ref(false)
+const forwardedSamples = ref(0)
+const heldSamples = ref(0)
 const muted = ref(false)
 const volume = ref(80)
 const errorText = ref("")
@@ -99,6 +102,8 @@ function onEvent(event: ServerEvent) {
     if (stage === "pause") micStatus.value = "停顿中，可以继续说"
   } else if (type === "audio.progress") {
     receivedSamples.value = Number(event.samples || 0)
+    forwardedSamples.value = Number(event.forwarded_samples || 0)
+    heldSamples.value = Number(event.held_samples || 0)
     receivedPeakText.value = formatLevel(Number(event.peak || 0))
     silenceHint.value = nextSilenceHint(silenceHint.value, "server", receivedSamples.value, Number(event.peak || 0))
   } else if (type === "asr.partial" || type === "asr.final") {
@@ -109,7 +114,11 @@ function onEvent(event: ServerEvent) {
     if (type === "asr.final") {
       if (utterance) sealedUtterance = utterance
       if (event.awaiting_edit) composer.value = text
-      micStatus.value = text ? "这句话已结束" : "没有识别到内容"
+      micStatus.value = event.review_reason
+        ? `${event.review_reason}。全文在输入框里，改完再发送，这里不会替你删字。`
+        : text
+          ? "这句话已结束"
+          : "没有识别到内容"
     }
   } else if (type === "turn.started") {
     const id = `user-${event.turn_id}`
@@ -153,6 +162,8 @@ function resetCaptureWait() {
   levelText.value = "0.0"
   peakText.value = "0.0"
   receivedSamples.value = 0
+  forwardedSamples.value = 0
+  heldSamples.value = 0
   receivedPeakText.value = "0.0"
   captureState.value = ""
   silenceHint.value = ""
@@ -216,6 +227,7 @@ async function beginSpeech() {
     pushError(secureHint.value)
     return
   }
+  player.stop()
   const generation = ++seqGuard
   resetCaptureWait()
   sendGate = new AudioSendGate((frame) => {
@@ -253,7 +265,7 @@ async function beginSpeech() {
     return
   }
   if (generation !== seqGuard) return
-  socket?.send({ type: "speech.start", auto_submit: autoSend.value })
+  socket?.send({ type: "speech.start", auto_submit: autoSend.value, review_growth: reviewGrowth.value })
   listening.value = true
   phase.value = "正在聆听"
   micStatus.value = "正在等待开口"
@@ -284,7 +296,7 @@ async function finishSpeech() {
   }
   const leftover = sendGate?.close() ?? []
   for (const frame of leftover) socket?.sendAudio(frame)
-  socket?.send({ type: "speech.finish", auto_submit: autoSend.value })
+  socket?.send({ type: "speech.finish", auto_submit: autoSend.value, review_growth: reviewGrowth.value })
   listening.value = false
   phase.value = "正在识别"
   micStatus.value = `已采集 ${frameCount.value} 帧 / ${sampleCount.value} 样本`
@@ -400,6 +412,11 @@ onBeforeUnmount(() => {
         <input v-model="autoSend" type="checkbox" />
         识别完成后自动发送
       </label>
+      <label class="check">
+        <input v-model="reviewGrowth" type="checkbox" />
+        停口后识别仍变长时，先让我改再发送
+      </label>
+      <p class="hint">自动发送保持打开。后一个选项默认关闭；打开后，只有识别在你停止出声之后又多出文字时才放进输入框。多出来的字会原样留下，供你自己删。</p>
       <p class="hint">{{ asrNote }}</p>
       <button type="button" class="secondary" @click="connect">重新连接</button>
     </section>
@@ -412,6 +429,8 @@ onBeforeUnmount(() => {
         <p data-testid="live-transcript-status">{{ micStatus || "还没开始" }}</p>
         <p class="live-text" data-testid="live-transcript-text">{{ draft || "开口后，识别文字会显示在这里" }}</p>
         <p class="hint">采集 {{ frameCount }} 帧 / {{ sampleCount }} 样本 · 已发送 {{ sentFrames }} 帧 · 服务端收到 {{ receivedSamples }} 样本</p>
+        <p class="hint">已送识别 {{ (forwardedSamples / 16000).toFixed(1) }} 秒 · 开口后的长静音未送 {{ (heldSamples / 16000).toFixed(1) }} 秒</p>
+        <p v-if="listening && sentFrames > 0 && !draft" class="hint">声音已经送出。识别服务通常要几秒才返回第一段整句，页面收到后整段替换，不会把已有的句子做成逐字动画。</p>
         <p class="hint">当前电平 {{ levelText }}% · 峰值 {{ peakText }}% · 服务端峰值 {{ receivedPeakText }}%</p>
         <div class="meter" aria-hidden="true"><span :style="{ width: Math.min(100, Number(peakText)) + '%' }"></span></div>
         <p v-if="silenceHint" class="error">{{ silenceHint }}</p>

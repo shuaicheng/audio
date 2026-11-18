@@ -9,7 +9,7 @@ from app.asr.base import AsrEvent
 from app.endpoint import UtteranceEndpoint
 from app.orchestrator import Orchestrator
 from app.protocol import encode_upstream_frame
-from tests.fakes import RecordingTts, ScriptLlm, ScriptedAsr
+from tests.fakes import PausingLlm, RecordingTts, ScriptLlm, ScriptedAsr
 
 
 def _pcm(value: int, milliseconds: int, rate: int = 16000) -> bytes:
@@ -173,3 +173,37 @@ async def test_manual_finish_racing_endpoint_submits_the_first_final_once(settin
     assert llm.calls == 1
     assert llm.messages[0][-1]["content"] == "一二三。"
     await orch.close()
+
+
+@pytest.mark.asyncio
+async def test_audio_during_playback_is_not_sent_to_recognition(settings):
+    asr = ScriptedAsr()
+
+    async def final_text() -> None:
+        await asr.queue.put(AsrEvent(kind="final", text="上一句"))
+
+    asr.finish = final_text
+    llm = PausingLlm()
+    orch = Orchestrator(settings, lambda: asr, llm, RecordingTts())
+    await orch.start_speech()
+    await orch.handle_audio(encode_upstream_frame(1, 16000, _pcm(12000, 200)))
+    await orch.finish_speech()
+    for _ in range(20):
+        if orch.phase == "answering":
+            break
+        await asyncio.sleep(0.02)
+    assert orch.phase == "answering"
+    before = len(asr.audio)
+    await orch.handle_audio(encode_upstream_frame(2, 16000, _pcm(12000, 200)))
+    events = await collect_events(orch)
+    assert any(event.get("code") == "not_listening" for event in events)
+    assert len(asr.audio) == before
+    llm.released.set()
+    await orch.close()
+
+
+async def collect_events(orch):
+    from tests.conftest import collect
+
+    events, _ = await collect(orch, 0.2)
+    return events
