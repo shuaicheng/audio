@@ -34,10 +34,12 @@ class DegradedFileAsr:
         self._next_seq = 1
         self._uploaded_until = 0
         self._lock = asyncio.Lock()
+        self.accepted = False
 
     async def start(self) -> None:
         if self._client is None:
             self._client = httpx.AsyncClient(timeout=self.settings.asr_timeout_sec)
+        self.accepted = True
         await self._events.put(
             AsrEvent(
                 kind="ready",

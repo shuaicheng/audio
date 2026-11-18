@@ -18,8 +18,10 @@ class MockAsrEngine:
         self._pcm = 0
         self._next_seq = 1
         self._closed = False
+        self.accepted = False
 
     async def start(self) -> None:
+        self.accepted = True
         await self._events.put(AsrEvent(kind="ready", validated=False, message="离线演示识别，不是真实模型"))
 
     async def push_audio(self, pcm: bytes, seq: int) -> None:

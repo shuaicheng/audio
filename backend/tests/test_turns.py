@@ -196,3 +196,25 @@ async def test_queue_limit_and_malformed_audio(settings):
     assert "malformed_audio" in codes
     assert orch.phase == "listening"
     await orch.close()
+
+
+@pytest.mark.asyncio
+async def test_rejected_asr_does_not_look_like_listening(settings):
+    class RejectAsr(ScriptedAsr):
+        async def start(self) -> None:
+            self.accepted = False
+            await self.queue.put(
+                __import__("app.asr.base", fromlist=["AsrEvent"]).AsrEvent(
+                    kind="unsupported",
+                    code="model_not_found",
+                    message="服务端不接受该识别模型",
+                )
+            )
+
+    orch = _orch(settings, ScriptLlm(["不会用到"]), RecordingTts(), RejectAsr())
+    await orch.start_speech()
+    events, _ = await collect(orch, 0.5)
+    assert orch.phase == "ready"
+    assert not any(event["type"] == "speech.started" for event in events)
+    assert any(event["type"] == "asr.unsupported" for event in events)
+    await orch.close()

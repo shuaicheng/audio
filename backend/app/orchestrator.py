@@ -166,6 +166,10 @@ class Orchestrator:
         self.utterance_bytes = 0
         self.audio_q = asyncio.Queue(maxsize=max(1, self.settings.max_audio_pending_chunks))
         await self.asr.start()
+        if not getattr(self.asr, "accepted", False):
+            self.phase = "ready"
+            self.listen_task = self._track(asyncio.create_task(self._pump_asr()))
+            return
         self.phase = "listening"
         self.audio_task = self._track(asyncio.create_task(self._pump_audio()))
         self.listen_task = self._track(asyncio.create_task(self._pump_asr()))

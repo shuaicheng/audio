@@ -43,6 +43,7 @@ class RealtimeAsrEngine:
         self._hypothesis = ""
         self._next_seq = 1
         self._got_terminal = False
+        self.accepted = False
 
     async def start(self) -> None:
         connect_kwargs: dict[str, Any] = {"open_timeout": self.settings.asr_handshake_timeout_sec}
@@ -76,6 +77,7 @@ class RealtimeAsrEngine:
         if await self._consume_probe():
             return
         self._started = True
+        self.accepted = True
         self._dispatcher = asyncio.create_task(self._dispatch_loop())
         await self._emit(AsrEvent(kind="ready", validated=True, message="本次连接已通过模型握手"))
 

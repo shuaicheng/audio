@@ -32,6 +32,7 @@ class QwenStreamingAsr:
         self._next_seq = 1
         self._last_text = None
         self._closed = False
+        self.accepted = False
 
     async def start(self) -> None:
         if self.pool is None:
@@ -41,6 +42,8 @@ class QwenStreamingAsr:
             self._stream_id = await self.pool.open_stream(self)
         except Exception as exc:
             await self._events.put(AsrEvent(kind="failed", code="worker_unavailable", message=str(exc)))
+            return
+        self.accepted = True
 
     async def push_audio(self, pcm: bytes, seq: int) -> None:
         if not self._stream_id or self._closed:

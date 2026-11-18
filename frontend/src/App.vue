@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from "vue"
-import { micErrorMessage, startCapture } from "./audio/capture"
+import { micErrorMessage, microphoneBlockReason, startCapture, type CaptureStats } from "./audio/capture"
 import { PcmPlayer } from "./audio/playback"
+import { AudioSendGate } from "./audio/sendGate"
 import { VoiceSocket, type ServerEvent } from "./net/session"
 
 type Role = "user" | "assistant"
@@ -27,9 +28,18 @@ const errorText = ref("")
 const note = ref("按住式对话：先开始说话，说完再结束。播报时不会自动抢话。")
 const asrNote = ref("")
 const messages = ref<ChatMessage[]>([])
+const captureState = ref("")
+const frameCount = ref(0)
+const sampleCount = ref(0)
+const levelPct = ref(0)
+const micStatus = ref("")
 let socket: VoiceSocket | null = null
 let stopMic: (() => Promise<void>) | null = null
+let sendGate: AudioSendGate | null = null
 let seqGuard = 0
+let asrReady = false
+let asrFailedMessage = ""
+let readyWaiters: Array<() => void> = []
 
 const player = new PcmPlayer(
   1.8,
@@ -39,6 +49,9 @@ const player = new PcmPlayer(
 const canStart = computed(() => connected.value && !listening.value && !answering.value)
 const canFinish = computed(() => connected.value && listening.value)
 const canStop = computed(() => connected.value && answering.value)
+const secureHint = computed(() =>
+  microphoneBlockReason(window.isSecureContext, !!navigator.mediaDevices?.getUserMedia),
+)
 
 function pushError(message: string) {
   if (message) errorText.value = message
@@ -67,6 +80,9 @@ function onEvent(event: ServerEvent) {
     const name = String(event.phase || "")
     listening.value = name === "listening"
     answering.value = name === "answering"
+  } else if (type === "speech.started" || type === "asr.ready") {
+    markAsrReady()
+    micStatus.value = "识别已就绪，正在发送音频"
   } else if (type === "asr.partial" || type === "asr.final") {
     draft.value = String(event.text || "")
     if (type === "asr.final" && event.awaiting_edit) composer.value = draft.value
@@ -94,8 +110,55 @@ function onEvent(event: ServerEvent) {
     composer.value = ""
   } else if (type === "asr.unsupported" || type === "asr.failed" || type === "tts.failed" || type === "timeout" || type === "queue.limit" || type === "audio.malformed" || type === "error") {
     pushError(String(event.message || "出现问题"))
-    if (type === "asr.failed" || type === "asr.unsupported") listening.value = false
+    if (type === "asr.failed" || type === "asr.unsupported") {
+      listening.value = false
+      if (!asrReady) markAsrFailed(String(event.message || "识别没有就绪"))
+      void stopMicNow()
+    }
   }
+}
+
+function resetCaptureWait() {
+  asrReady = false
+  asrFailedMessage = ""
+  readyWaiters = []
+  frameCount.value = 0
+  sampleCount.value = 0
+  levelPct.value = 0
+  captureState.value = ""
+  micStatus.value = "正在打开麦克风"
+}
+
+function markAsrReady() {
+  if (asrReady || asrFailedMessage) return
+  asrReady = true
+  sendGate?.release()
+  readyWaiters.splice(0).forEach((wake) => wake())
+}
+
+function markAsrFailed(message: string) {
+  if (asrReady || asrFailedMessage) return
+  asrFailedMessage = message
+  sendGate?.close()
+  readyWaiters.splice(0).forEach((wake) => wake())
+}
+
+function waitForAsr(timeoutMs: number): Promise<boolean> {
+  if (asrReady) return Promise.resolve(true)
+  if (asrFailedMessage) return Promise.resolve(false)
+  return new Promise((resolve) => {
+    const timer = window.setTimeout(() => resolve(asrReady), timeoutMs)
+    readyWaiters.push(() => {
+      window.clearTimeout(timer)
+      resolve(asrReady && !asrFailedMessage)
+    })
+  })
+}
+
+async function stopMicNow() {
+  const stop = stopMic
+  stopMic = null
+  if (stop) await stop()
 }
 
 function onAudio(frame: { turnId: string; pcm: Int16Array; sampleRate: number; channels: number }) {
@@ -117,34 +180,78 @@ async function connect() {
 
 async function beginSpeech() {
   errorText.value = ""
-  try {
-    await player.resume()
-    const generation = ++seqGuard
-    stopMic = await startCapture((frame) => {
-      if (generation === seqGuard) socket?.sendAudio(frame)
-    })
-    socket?.send({ type: "speech.start" })
-    listening.value = true
-    phase.value = "正在聆听"
-  } catch (error) {
-    pushError(micErrorMessage(error))
+  if (secureHint.value) {
+    pushError(secureHint.value)
+    return
   }
+  const generation = ++seqGuard
+  resetCaptureWait()
+  sendGate = new AudioSendGate((frame) => {
+    if (generation === seqGuard) socket?.sendAudio(frame)
+  })
+  const playbackReady = player.resume()
+  try {
+    stopMic = await startCapture({
+      onFrame: (frame) => sendGate?.push(frame),
+      onStats: (stats: CaptureStats) => {
+        if (generation !== seqGuard) return
+        captureState.value = stats.contextState
+        frameCount.value = stats.frames
+        sampleCount.value = stats.samples
+        levelPct.value = Math.round(stats.level * 100)
+      },
+    })
+    await playbackReady
+  } catch (error) {
+    seqGuard += 1
+    sendGate.close()
+    await stopMicNow()
+    pushError(micErrorMessage(error))
+    return
+  }
+  if (generation !== seqGuard) return
+  socket?.send({ type: "speech.start" })
+  listening.value = true
+  phase.value = "正在聆听"
+  micStatus.value = captureState.value === "running" ? "录音已启动，等待识别通道" : `录音上下文 ${captureState.value || "未知"}`
+  window.setTimeout(() => {
+    if (generation !== seqGuard || !listening.value) return
+    if (sampleCount.value === 0) {
+      pushError("还没有收到麦克风采样。如果刚刚才允许权限，请再点一次「开始说话」。")
+    }
+  }, 1500)
 }
 
 async function finishSpeech() {
-  if (stopMic) await stopMic()
-  stopMic = null
+  const generation = seqGuard
+  await stopMicNow()
+  if (generation !== seqGuard) return
+  const ready = await waitForAsr(8000)
+  if (!ready || asrFailedMessage) {
+    pushError(asrFailedMessage || "识别通道没有就绪，这次录音已取消。")
+    sendGate?.close()
+    socket?.send({ type: "speech.cancel" })
+    listening.value = false
+    phase.value = "待命"
+    return
+  }
+  const leftover = sendGate?.close() ?? []
+  for (const frame of leftover) socket?.sendAudio(frame)
   socket?.send({ type: "speech.finish", auto_submit: autoSend.value })
   listening.value = false
   phase.value = "正在识别"
+  micStatus.value = `已送出 ${frameCount.value} 帧 / ${sampleCount.value} 样本`
 }
 
 async function cancelSpeech() {
-  if (stopMic) await stopMic()
-  stopMic = null
+  seqGuard += 1
+  sendGate?.close()
+  await stopMicNow()
   socket?.send({ type: "speech.cancel" })
   listening.value = false
   draft.value = ""
+  micStatus.value = "已取消"
+  phase.value = "待命"
 }
 
 function submitText() {
@@ -223,11 +330,15 @@ onBeforeUnmount(() => {
         <input v-model="autoSend" type="checkbox" />
         识别完成后自动发送
       </label>
+      <p v-if="listening || micStatus" class="hint">{{ micStatus }}</p>
+      <p v-if="listening" class="hint">录音 {{ captureState || "启动中" }} · {{ frameCount }} 帧 / {{ sampleCount }} 样本 · 电平 {{ levelPct }}%</p>
+      <div v-if="listening" class="meter" aria-hidden="true"><span :style="{ width: levelPct + '%' }"></span></div>
       <p v-if="draft" class="draft">实时转写：{{ draft }}</p>
       <p class="hint">{{ asrNote }}</p>
       <button type="button" class="secondary" @click="connect">重新连接</button>
     </section>
     <section class="paper">
+      <div v-if="secureHint" class="error">{{ secureHint }}</div>
       <div v-if="demoLabel" class="banner">{{ demoLabel }}</div>
       <div v-if="errorText" class="error">{{ errorText }}</div>
       <div class="messages">

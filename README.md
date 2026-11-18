@@ -18,7 +18,7 @@
   -> Web Audio 按采样帧排队播放
 ```
 
-识别采样率固定 16000。合成采样率单独配置，默认 24000，也可从响应头 `X-Sample-Rate` / `X-Audio-Sample-Rate` 读取。不要假定两者相同。
+识别采样率固定 16000。合成采样率不要假定与识别相同。`stream=true` 时上游返回 `text/event-stream`，PCM 在 `speech.audio.delta` 的 base64 `audio` 字段里，并带 `sample_rate`。`stream=false` 才是裸 `audio/pcm`，采样率可能在 `X-Audio-Sample-Rate`。两种都按块解码后立即播放，不会先攒完整段回答。
 
 ## 本地启动
 
@@ -80,7 +80,7 @@ cp .env.example .env
 docker compose up --build
 ```
 
-页面在 `http://localhost:8088`，接口由容器内 Nginx 反代到后端。远程部署不要用这个明文端口给麦克风用。
+页面在 `http://localhost:8088`。后端宿主机端口是 `BACKEND_HOST_PORT`，默认 `8080`，容器内仍监听 8080。远程部署不要用明文 HTTP 打开麦克风。
 
 ## 反向代理和 HTTPS
 
@@ -148,16 +148,15 @@ python3 -m venv /opt/qwen-asr-venv
 
 ## 真实上游兼容性
 
-这次交付**没有**连接 `120.48.180.39`，没有上传音频，也没有发起付费或线上推理。下表里的「未验证」就是还没做的线上确认。
+本环境再次连接 `120.48.180.39:10001` 时连接超时，所以下面的线上结论来自已授权的部署实测，解析器用相同的 SSE 形状做了回归。没有使用用户录音。
 
-| 项目 | 代码状态 | 线上验证 |
+| 项目 | 代码状态 | 线上情况 |
 | --- | --- | --- |
-| vLLM Realtime 握手与音频事件 | 已按文档实现，并用本地假服务测试 | 未对 `ws://120.48.180.39:10002/v1/realtime` 发起连接 |
-| 该实例是否接受 `Qwen3-ASR-1.7B` 作为 Realtime 模型 | 拒绝时会返回 `asr.unsupported` | 未知。不能从「vLLM 有这个路由」推断 |
-| 官方 `qwen-asr` 流式三接口 | worker 会真实调用这些方法 | 本环境未安装 `qwen-asr`，未加载权重 |
-| 文件转写 | 仅显式降级 | 未调用 |
-| 语言模型 SSE | 已实现分片解析，忽略 `reasoning_content` 和工具字段 | 未调用 |
-| PCM 流式合成 | 已按给定 JSON 实现 | 未调用 |
+| vLLM Realtime 与 `Qwen3-ASR-1.7B` | 握手成功后才发 `speech.started`；浏览器在此之前只缓存音频 | 部署实测该路由可用。浏览器麦克风仍需在本机确认 |
+| 官方 `qwen-asr` 流式三接口 | worker 会真实调用这些方法 | 本环境未安装权重 |
+| 文件转写 | 仅显式降级 | 未当作默认路径 |
+| 语言模型 SSE | 只取可见正文 | 部署实测已通过 |
+| 流式合成 | `speech.audio.delta` 的 base64 PCM 会按 `sample_rate` 播放；裸 PCM 仍然支持 | `stream=true` 实际是 `text/event-stream`，没有采样率响应头 |
 
 人工要检查时，可以在确认允许访问该机器后执行：
 

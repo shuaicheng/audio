@@ -17,10 +17,12 @@ class ScriptedAsr:
         self.finished = False
         self.block = asyncio.Event()
         self.block_audio = block_audio
+        self.accepted = False
         for event in events or []:
             self.queue.put_nowait(event)
 
     async def start(self) -> None:
+        self.accepted = True
         await self.queue.put(AsrEvent(kind="ready", validated=True))
 
     async def push_audio(self, pcm: bytes, seq: int) -> None:

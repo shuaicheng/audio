@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest"
+import { microphoneBlockReason, pcmLevel, resumeOrThrow } from "../src/audio/capture"
+import { AudioSendGate } from "../src/audio/sendGate"
 import { alignedFrameCount, bufferDuration, nextStartTime } from "../src/audio/playback"
 import { createResampleState, downmix, floatToInt16, resampleBlock } from "../src/audio/resample"
 import { buildWorkletSource } from "../src/audio/worklet"
@@ -43,6 +45,41 @@ describe("playback alignment", () => {
     expect(alignedFrameCount(5, 1)).toBe(2)
     expect(bufferDuration(24000, 24000)).toBe(1)
     expect(bufferDuration(16000, 24000)).toBeCloseTo(16000 / 24000)
+  })
+})
+
+describe("microphone startup", () => {
+  it("explains insecure context and suspended capture", async () => {
+    expect(microphoneBlockReason(false, true)).toContain("HTTPS")
+    expect(microphoneBlockReason(true, false)).toContain("麦克风")
+    expect(microphoneBlockReason(true, true)).toBeNull()
+    const context = { state: "suspended", async resume() { this.state = "running" } }
+    await resumeOrThrow(context)
+    expect(context.state).toBe("running")
+    await expect(resumeOrThrow({ state: "suspended", async resume() {} })).rejects.toThrow(/挂起/)
+  })
+
+  it("buffers frames until recognition is ready and then keeps order", () => {
+    const sent: string[] = []
+    const gate = new AudioSendGate((frame) => sent.push(new TextDecoder().decode(frame)))
+    gate.push(new TextEncoder().encode("a").buffer)
+    gate.push(new TextEncoder().encode("b").buffer)
+    expect(sent).toEqual([])
+    gate.release()
+    gate.push(new TextEncoder().encode("c").buffer)
+    expect(sent).toEqual(["a", "b", "c"])
+    expect(gate.close()).toEqual([])
+    gate.push(new TextEncoder().encode("d").buffer)
+    expect(sent).toEqual(["a", "b", "c"])
+  })
+
+  it("returns unsent frames when recording stops before ready", () => {
+    const gate = new AudioSendGate(() => undefined)
+    gate.push(new TextEncoder().encode("tail").buffer)
+    const leftover = gate.close()
+    expect(new TextDecoder().decode(leftover[0])).toBe("tail")
+    expect(pcmLevel(new Int16Array([0, 0]))).toBe(0)
+    expect(pcmLevel(new Int16Array([32767]))).toBeGreaterThan(0.99)
   })
 })
 

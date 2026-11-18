@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 
 import httpx
 
 from app.config import Settings
 from app.redact import scrub
+
+logger = logging.getLogger(__name__)
 
 
 class TtsError(Exception):
@@ -22,7 +25,7 @@ class TtsClient:
         self._client = client
 
     async def stream(self, text: str, cancelled: asyncio.Event) -> AsyncIterator[tuple[bytes, int]]:
-        headers: dict[str, str] = {"Accept": "application/octet-stream"}
+        headers: dict[str, str] = {"Accept": "text/event-stream, application/octet-stream, audio/pcm"}
         if self.settings.tts_authorization:
             value = self.settings.tts_authorization
             headers["Authorization"] = value if value.lower().startswith("bearer ") else f"Bearer {value}"
@@ -44,12 +47,31 @@ class TtsClient:
             async with client.stream("POST", self.settings.tts_url, headers=headers, json=body) as response:
                 if response.status_code >= 400:
                     raise TtsError("tts_http", f"语音合成失败（HTTP {response.status_code}）")
-                sample_rate = _header_rate(response.headers) or self.settings.tts_sample_rate
-                async for chunk in response.aiter_bytes():
+                content_type = response.headers.get("content-type", "")
+                from app.tts_stream import TtsByteDecoder
+
+                decoder = TtsByteDecoder(
+                    fallback_rate=_header_rate(response.headers) or self.settings.tts_sample_rate,
+                    content_type=content_type,
+                )
+                logger.info("语音合成响应 content-type=%s", content_type.split(";")[0] or "unknown")
+
+                async def pieces():
+                    async for chunk in response.aiter_bytes():
+                        if cancelled.is_set():
+                            return
+                        for piece in decoder.feed(chunk):
+                            yield piece
+                    for piece in decoder.finish():
+                        if cancelled.is_set():
+                            return
+                        yield piece
+
+                async for piece in pieces():
                     if cancelled.is_set():
                         return
-                    if chunk:
-                        yield chunk, sample_rate
+                    if piece.pcm:
+                        yield piece.pcm, piece.sample_rate
         except TtsError:
             raise
         except Exception as exc:
