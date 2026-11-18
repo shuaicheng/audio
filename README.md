@@ -72,12 +72,16 @@ APP_MODE=mock uvicorn app.main:app --host 0.0.0.0 --port 8080
 | `APP_AUTH_TOKEN` | 本服务自己的 WebSocket 门禁，不是上游密钥 |
 | `VITE_APP_AUTH_TOKEN` | 仅当需要上一项时由前端发送。Vite 变量会进浏览器，不能拿来放上游密钥 |
 | `CORS_ORIGINS` | 允许的浏览器来源，逗号分隔 |
+| `ASR_CORRECT_ENABLED` | 终稿校正，默认 `true`。只在一句结束之后跑一次 |
+| `ASR_CORRECT_TIMEOUT_SEC` | 校正超时秒数，默认 8。超时使用原稿 |
+| `ASR_CORRECT_GLOSSARY` | `错词=正词`，分号分隔。默认空，不会自带专名 |
 
 默认上游：
 
 - 识别文件接口：`http://120.48.180.39:10002/v1/audio/transcriptions`，模型 `Qwen3-ASR-1.7B`
 - 识别实时候选：`ws://120.48.180.39:10002/v1/realtime`
-- 语言模型：`http://120.48.180.39:20002/v1/chat/completions`，模型 `Qwen3.8-Flash`，请求里 `stream: true`
+- 语言模型：`http://120.48.180.39:20002/v1/chat/completions`，模型 `Qwen3.8-Flash`，对话请求 `stream: true`
+- 终稿校正复用同一个地址和模型，但是单独的非流式请求，系统提示固定，识别文本放在 `transcript` 里当数据。页面上「终稿后校正标点和词表」默认勾选。校正时转写区显示「正在校正」；失败显示「使用原稿」。原稿和修正稿同时可见。关闭自动发送时，修正稿只作为「采用修正稿」，不会覆盖已经改过的输入框。
 - 语音合成：`POST http://120.48.180.39:10001/v1/audio/speech`，模型 `/models/Qwen3-TTS-12Hz-1.7B-CustomVoice`，`voice=vivian`，`language` 可配，`stream=true`，`response_format=pcm`
 
 ## Docker

@@ -23,6 +23,13 @@ const draft = ref("")
 const composer = ref("")
 const autoSend = ref(true)
 const reviewGrowth = ref(false)
+const correctOn = ref(true)
+const rawFinal = ref("")
+const correctedText = ref("")
+const suggestText = ref("")
+const correctNote = ref("")
+let composerDirty = false
+let correctUtterance = ""
 const forwardedSamples = ref(0)
 const heldSamples = ref(0)
 const muted = ref(false)
@@ -108,11 +115,18 @@ function onEvent(event: ServerEvent) {
     silenceHint.value = nextSilenceHint(silenceHint.value, "server", receivedSamples.value, Number(event.peak || 0))
   } else if (type === "asr.partial" || type === "asr.final") {
     const utterance = String(event.utterance_id || "")
-    if (utterance && utterance === sealedUtterance) return
+    if (utterance && utterance === sealedUtterance && type === "asr.partial") return
+    if (type === "asr.final" && utterance && utterance === sealedUtterance) return
     const text = String(event.text || "")
     if (text) draft.value = text
     if (type === "asr.final") {
       if (utterance) sealedUtterance = utterance
+      correctUtterance = utterance
+      rawFinal.value = text
+      correctedText.value = ""
+      suggestText.value = ""
+      correctNote.value = ""
+      composerDirty = false
       if (event.awaiting_edit) composer.value = text
       micStatus.value = event.review_reason
         ? `${event.review_reason}。全文在输入框里，改完再发送，这里不会替你删字。`
@@ -120,6 +134,34 @@ function onEvent(event: ServerEvent) {
           ? "这句话已结束"
           : "没有识别到内容"
     }
+  } else if (type === "asr.correcting") {
+    const utterance = String(event.utterance_id || "")
+    if (utterance !== correctUtterance) return
+    micStatus.value = "正在校正。这句话已经结束，不会挡住下一次开口，也不能保证马上完成。"
+  } else if (type === "asr.corrected") {
+    const utterance = String(event.utterance_id || "")
+    if (utterance !== correctUtterance) return
+    const original = String(event.original || rawFinal.value || "")
+    const text = String(event.text || original)
+    const reason = String(event.reason || "")
+    const elapsed = Number(event.elapsed_ms || 0)
+    rawFinal.value = original
+    if (text && text !== original) correctedText.value = text
+    else correctedText.value = ""
+    if (event.suggest_only && text && text !== original && !composerDirty) suggestText.value = text
+    const changeText = Array.isArray(event.changes)
+      ? event.changes
+          .map((item) => {
+            const change = item as { kind?: string; from?: string; to?: string }
+            if (change.kind === "glossary") return `${change.from} → ${change.to}`
+            if (change.kind === "punctuation") return "调整了标点"
+            return ""
+          })
+          .filter(Boolean)
+          .join("；")
+      : ""
+    correctNote.value = [correctReason(reason), elapsed ? `用时 ${elapsed} 毫秒。` : "", changeText ? `${changeText}。` : ""].filter(Boolean).join("")
+    micStatus.value = correctReason(reason)
   } else if (type === "turn.started") {
     const id = `user-${event.turn_id}`
     if (messages.value.some((item) => item.id === id)) return
@@ -152,6 +194,28 @@ function onEvent(event: ServerEvent) {
   }
 }
 
+function correctReason(reason: string): string {
+  if (reason === "ok") return "已用修正稿。只接受了标点或词表，没有补写没识别到的内容。"
+  if (reason === "mock") return "离线校正只补了句末标点，不是线上模型。"
+  if (reason === "glossary") return "已按词表替换，其余保持原稿。"
+  if (reason === "original") return "校正后与原稿一致。"
+  if (reason === "fallback_timeout") return "校正超时，使用原稿。"
+  if (reason === "fallback_empty") return "校正没有返回文字，使用原稿。"
+  if (reason === "fallback_invalid") return "校正结果不能用，使用原稿。"
+  if (reason === "fallback_unconfigured") return "没有配置校正用的语言模型，使用原稿。"
+  return "使用原稿。"
+}
+
+function shownTranscript(): string {
+  return correctedText.value || draft.value
+}
+
+function adoptSuggestion() {
+  if (!suggestText.value) return
+  composer.value = suggestText.value
+  composerDirty = true
+}
+
 function resetCaptureWait() {
   asrReady = false
   asrFailedMessage = ""
@@ -168,6 +232,12 @@ function resetCaptureWait() {
   captureState.value = ""
   silenceHint.value = ""
   sealedUtterance = ""
+  correctUtterance = ""
+  rawFinal.value = ""
+  correctedText.value = ""
+  suggestText.value = ""
+  correctNote.value = ""
+  composerDirty = false
   draft.value = ""
   micStatus.value = "正在打开麦克风"
 }
@@ -265,7 +335,12 @@ async function beginSpeech() {
     return
   }
   if (generation !== seqGuard) return
-  socket?.send({ type: "speech.start", auto_submit: autoSend.value, review_growth: reviewGrowth.value })
+  socket?.send({
+    type: "speech.start",
+    auto_submit: autoSend.value,
+    review_growth: reviewGrowth.value,
+    correct: correctOn.value,
+  })
   listening.value = true
   phase.value = "正在聆听"
   micStatus.value = "正在等待开口"
@@ -331,8 +406,11 @@ async function refreshDevices() {
 function submitText() {
   const text = composer.value.trim()
   if (!text) return
+  correctUtterance = ""
   socket?.send({ type: "text.submit", text })
   composer.value = ""
+  composerDirty = false
+  suggestText.value = ""
 }
 
 function stopAnswer() {
@@ -416,6 +494,11 @@ onBeforeUnmount(() => {
         <input v-model="reviewGrowth" type="checkbox" />
         停口后识别仍变长时，先让我改再发送
       </label>
+      <label class="check">
+        <input v-model="correctOn" type="checkbox" :disabled="listening" />
+        终稿后校正标点和词表
+      </label>
+      <p class="hint">校正默认打开。它在这句话结束之后单独请求一次，不跟着每个字走，也不保证马上完成。失败就用原稿。它不能补回没识别到的声音，也不能改数字、否定和词表以外的专名。</p>
       <p class="hint">自动发送保持打开。后一个选项默认关闭；打开后，只有识别在你停止出声之后又多出文字时才放进输入框。多出来的字会原样留下，供你自己删。</p>
       <p class="hint">{{ asrNote }}</p>
       <button type="button" class="secondary" @click="connect">重新连接</button>
@@ -427,7 +510,10 @@ onBeforeUnmount(() => {
       <section class="live-transcript" data-testid="live-transcript">
         <h2>实时转写</h2>
         <p data-testid="live-transcript-status">{{ micStatus || "还没开始" }}</p>
-        <p class="live-text" data-testid="live-transcript-text">{{ draft || "开口后，识别文字会显示在这里" }}</p>
+        <p class="live-text" data-testid="live-transcript-text">{{ shownTranscript() || "开口后，识别文字会显示在这里" }}</p>
+        <p v-if="rawFinal && shownTranscript() !== rawFinal" class="hint" data-testid="live-transcript-original">原稿：{{ rawFinal }}</p>
+        <p v-if="correctNote" class="hint" data-testid="correct-note">{{ correctNote }}</p>
+        <button v-if="suggestText" type="button" class="secondary" @click="adoptSuggestion">采用修正稿</button>
         <p class="hint">采集 {{ frameCount }} 帧 / {{ sampleCount }} 样本 · 已发送 {{ sentFrames }} 帧 · 服务端收到 {{ receivedSamples }} 样本</p>
         <p class="hint">已送识别 {{ (forwardedSamples / 16000).toFixed(1) }} 秒 · 开口后的长静音未送 {{ (heldSamples / 16000).toFixed(1) }} 秒</p>
         <p v-if="listening && sentFrames > 0 && !draft" class="hint">声音已经送出。识别服务通常要几秒才返回第一段整句，页面收到后整段替换，不会把已有的句子做成逐字动画。</p>
@@ -445,7 +531,7 @@ onBeforeUnmount(() => {
         <p v-if="messages.length === 0" class="meta">回答会出现在这里。正在说的话看上面的实时转写。</p>
       </div>
       <div class="composer">
-        <textarea v-model="composer" placeholder="输入文字，或在关闭自动发送后修改识别结果" @keydown="onKeydown"></textarea>
+        <textarea v-model="composer" placeholder="输入文字，或在关闭自动发送后修改识别结果" @input="composerDirty = true" @keydown="onKeydown"></textarea>
         <button type="button" :disabled="!connected || !composer.trim()" @click="submitText">发送</button>
       </div>
     </section>

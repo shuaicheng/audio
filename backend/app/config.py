@@ -80,6 +80,9 @@ class Settings(BaseSettings):
     endpoint_onset_rms: float = 0.05
     endpoint_release_rms: float = 0.02
     asr_silence_tail_ms: int = 350
+    asr_correct_enabled: bool = True
+    asr_correct_timeout_sec: float = 8
+    asr_correct_glossary: str = ""
 
     secrets_fingerprint: str = Field(default="", exclude=True)
 

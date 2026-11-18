@@ -39,7 +39,7 @@ class Turn:
 
 
 class Orchestrator:
-    def __init__(self, settings: Settings, asr_factory: Callable, llm, tts) -> None:
+    def __init__(self, settings: Settings, asr_factory: Callable, llm, tts, corrector=None) -> None:
         self.settings = settings
         self.asr_factory = asr_factory
         self.llm = llm
@@ -65,6 +65,9 @@ class Orchestrator:
         self._asr_seq = 0
         self._forward: AsrForwardGate | None = None
         self.review_growth = False
+        self.corrector = corrector
+        self.correct_enabled = settings.asr_correct_enabled
+        self._correct_token = 0
         self.gate = PlaybackGate(settings.playback_max_inflight_bytes)
         self.closed = False
         self._tasks: set[asyncio.Task] = set()
@@ -115,6 +118,8 @@ class Orchestrator:
                 self.auto_submit = message.get("auto_submit") is not False
             if "review_growth" in message:
                 self.review_growth = message.get("review_growth") is True
+            if "correct" in message:
+                self.correct_enabled = message.get("correct") is True
             await self.start_speech()
         elif kind == "speech.finish":
             if "review_growth" in message:
@@ -201,6 +206,7 @@ class Orchestrator:
             return
         if self.phase == "listening":
             return
+        self._correct_token += 1
         self.asr = self.asr_factory()
         self.utterance_id = new_id("utt")
         self.utterance_bytes = 0
@@ -272,6 +278,7 @@ class Orchestrator:
             await self.asr.finish()
 
     async def cancel_speech(self) -> None:
+        self._correct_token += 1
         if self.phase not in {"listening", "recognizing"} and self.asr is None:
             return
         self.phase = "ready"
@@ -291,6 +298,7 @@ class Orchestrator:
         await self.emit_state()
 
     async def submit_text(self, text: str) -> None:
+        self._correct_token += 1
         cleaned = text.strip()
         if not cleaned:
             await self.emit({"type": "error", "code": "empty_text", "message": "没有可发送的文字"})
@@ -321,6 +329,7 @@ class Orchestrator:
         await self.emit_state()
 
     async def clear(self) -> None:
+        self._correct_token += 1
         if self.phase in {"listening", "recognizing"}:
             await self.cancel_speech()
         if self.turn and not self.turn.cancelled:
@@ -437,7 +446,17 @@ class Orchestrator:
                             "review_reason": "停口之后识别又变长了" if review else "",
                         }
                     )
-                    if text and self.auto_submit and not review:
+                    should_submit = bool(text) and self.auto_submit and not review
+                    if text and self.correct_enabled and self.corrector is not None:
+                        token = self._correct_token
+                        self.phase = "ready"
+                        await self.emit_state()
+                        self._track(
+                            asyncio.create_task(
+                                self._finish_with_correction(text, self.utterance_id, should_submit, token)
+                            )
+                        )
+                    elif should_submit:
                         await self._start_turn(text, source="speech", utterance_id=self.utterance_id)
                     elif text:
                         self.phase = "ready"
@@ -480,7 +499,38 @@ class Orchestrator:
                 with contextlib.suppress(Exception):
                     await asr.close()
 
-    async def _start_turn(self, text: str, source: str, utterance_id: str) -> None:
+    async def _finish_with_correction(self, text: str, utterance_id: str, should_submit: bool, token: int) -> None:
+        from app.text.correct import Correction
+
+        await self.emit({"type": "asr.correcting", "utterance_id": utterance_id, "original": text})
+        try:
+            result = await asyncio.wait_for(
+                self.corrector.correct(text, asyncio.Event()),
+                self.settings.asr_correct_timeout_sec,
+            )
+        except TimeoutError:
+            result = Correction(text=text, original=text, reason="fallback_timeout", source="original")
+        except Exception:
+            result = Correction(text=text, original=text, reason="fallback_invalid", source="original")
+        if token != self._correct_token or self.utterance_id != utterance_id:
+            return
+        if self._utterance_already_submitted(utterance_id):
+            return
+        await self.emit(result.event(utterance_id, suggest_only=not should_submit))
+        if token != self._correct_token or self.utterance_id != utterance_id:
+            return
+        if not should_submit or self._utterance_already_submitted(utterance_id):
+            return
+        await self._start_turn(result.text or text, source="speech", utterance_id=utterance_id, token=token)
+
+    def _utterance_already_submitted(self, utterance_id: str) -> bool:
+        return any(item.get("role") == "user" and item.get("utterance_id") == utterance_id for item in self.history)
+
+    async def _start_turn(self, text: str, source: str, utterance_id: str, token: int | None = None) -> None:
+        if token is not None and token != self._correct_token:
+            return
+        if self._utterance_already_submitted(utterance_id):
+            return
         if self.turn and not self.turn.cancelled:
             await self.stop_answer("replaced")
         turn = Turn(turn_id=new_id("turn"), utterance_id=utterance_id, source=source)

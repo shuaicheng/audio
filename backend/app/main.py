@@ -14,6 +14,7 @@ from app.asr.qwen_streaming import QwenWorkerPool
 from app.config import Settings
 from app.demo import MockLlm, MockTts
 from app.llm import LlmClient
+from app.text.correct import TranscriptCorrector
 from app.orchestrator import Orchestrator
 from app.tts import TtsClient
 
@@ -58,9 +59,16 @@ class Hub:
         else:
             self.llm = LlmClient(settings)
             self.tts = TtsClient(settings)
+        self.corrector = TranscriptCorrector(settings) if settings.asr_correct_enabled else None
 
     def open(self) -> Orchestrator:
-        return Orchestrator(self.settings, lambda: build_asr(self.settings, self.pool), self.llm, self.tts)
+        return Orchestrator(
+            self.settings,
+            lambda: build_asr(self.settings, self.pool),
+            self.llm,
+            self.tts,
+            self.corrector,
+        )
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -113,6 +121,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "validated_live": False,
             "timestamps": False,
             "duplex": "push_to_talk",
+            "asr_correct": settings.asr_correct_enabled,
         }
 
     @app.websocket("/api/ws")
