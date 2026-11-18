@@ -17,6 +17,20 @@ def _pcm(value: int, milliseconds: int, rate: int = 16000) -> bytes:
     return array.array("h", [value] * count).tobytes()
 
 
+def test_weak_continuous_sound_counts_and_near_silence_does_not():
+    clock = {"t": 0.0}
+    endpoint = UtteranceEndpoint(16000, onset_rms=0.02, onset_ms=480, clock=lambda: clock["t"])
+    for step in range(60):
+        clock["t"] = step * 0.1
+        assert endpoint.feed(_pcm(120, 100)) is False
+    assert endpoint.stage == "waiting"
+    clock["t"] = 10
+    assert endpoint.feed(_pcm(1200, 100)) is False
+    clock["t"] = 10.5
+    assert endpoint.feed(_pcm(1200, 100)) is False
+    assert endpoint.stage == "speech"
+
+
 def test_leading_silence_noise_and_pause_use_wall_clock():
     clock = {"t": 0.0}
     endpoint = UtteranceEndpoint(16000, onset_ms=480, silence_ms=1400, clock=lambda: clock["t"])

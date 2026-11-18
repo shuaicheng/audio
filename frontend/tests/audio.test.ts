@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { microphoneBlockReason, pcmLevel, resumeOrThrow } from "../src/audio/capture"
+import { formatLevel, microphoneBlockReason, pcmLevel, resumeOrThrow } from "../src/audio/capture"
 import { AudioSendGate } from "../src/audio/sendGate"
 import { alignedFrameCount, bufferDuration, nextStartTime } from "../src/audio/playback"
 import { createResampleState, downmix, floatToInt16, resampleBlock } from "../src/audio/resample"
@@ -83,6 +83,8 @@ describe("microphone startup", () => {
     expect(new TextDecoder().decode(leftover[0])).toBe("tail")
     expect(pcmLevel(new Int16Array([0, 0]))).toBe(0)
     expect(pcmLevel(new Int16Array([32767]))).toBeGreaterThan(0.99)
+    expect(formatLevel(0.004)).toBe("0.4")
+    expect(formatLevel(0.15)).toBe("15")
   })
 })
 

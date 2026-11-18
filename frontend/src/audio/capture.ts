@@ -21,6 +21,12 @@ export function microphoneBlockReason(isSecureContext: boolean, hasGetUserMedia:
   return null
 }
 
+export function formatLevel(rms: number): string {
+  const percent = Math.max(0, rms) * 100
+  if (percent < 10) return percent.toFixed(1)
+  return String(Math.round(percent))
+}
+
 export function pcmLevel(pcm: Int16Array): number {
   if (pcm.length === 0) return 0
   let sum = 0
@@ -62,6 +68,7 @@ export function micErrorMessage(error: unknown): string {
 }
 
 export async function startCapture(hooks: {
+  deviceId?: string
   onFrame: (frame: ArrayBuffer) => void
   onStats?: (stats: CaptureStats) => void
   onError?: (message: string) => void
@@ -75,7 +82,8 @@ export async function startCapture(hooks: {
       channelCount: 1,
       echoCancellation: true,
       noiseSuppression: true,
-      autoGainControl: false,
+      autoGainControl: true,
+      ...(hooks.deviceId ? { deviceId: { exact: hooks.deviceId } } : {}),
     },
     video: false,
   })

@@ -4,6 +4,7 @@ import asyncio
 
 from app.asr.base import AsrEvent
 from app.config import Settings
+from app.endpoint import pcm_rms
 
 
 class MockAsrEngine:
@@ -16,6 +17,8 @@ class MockAsrEngine:
         self.settings = settings
         self._events: asyncio.Queue[AsrEvent | None] = asyncio.Queue()
         self._pcm = 0
+        self._voiced = 0
+        self._partial_rev = 0
         self._next_seq = 1
         self._closed = False
         self.accepted = False
@@ -30,6 +33,14 @@ class MockAsrEngine:
             return
         self._next_seq = seq + 1
         self._pcm += len(pcm)
+        if pcm_rms(pcm) >= 0.01:
+            self._voiced += len(pcm) // 2
+        if self._voiced >= 8000 and self._partial_rev < 1:
+            self._partial_rev = 1
+            await self._events.put(AsrEvent(kind="partial", text="离线演示：已收到声音，这不是真实识别。", timestamps=False))
+        elif self._voiced >= 24000 and self._partial_rev < 2:
+            self._partial_rev = 2
+            await self._events.put(AsrEvent(kind="partial", text="离线演示：仍在接收声音，这不是真实识别。", timestamps=False))
 
     async def finish(self) -> None:
         if self._pcm <= 0:

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from "vue"
-import { micErrorMessage, microphoneBlockReason, startCapture, type CaptureStats } from "./audio/capture"
+import { formatLevel, micErrorMessage, microphoneBlockReason, startCapture, type CaptureStats } from "./audio/capture"
 import { PcmPlayer } from "./audio/playback"
 import { AudioSendGate } from "./audio/sendGate"
 import { VoiceSocket, type ServerEvent } from "./net/session"
@@ -30,9 +30,17 @@ const asrNote = ref("")
 const messages = ref<ChatMessage[]>([])
 const captureState = ref("")
 const frameCount = ref(0)
+const sentFrames = ref(0)
 const sampleCount = ref(0)
-const levelPct = ref(0)
+const levelText = ref("0.0")
+const peakText = ref("0.0")
+const receivedSamples = ref(0)
+const receivedPeakText = ref("0.0")
 const micStatus = ref("")
+const silenceHint = ref("")
+const devices = ref<Array<{ id: string; label: string }>>([])
+const deviceId = ref("")
+const currentDevice = ref("尚未选择")
 let socket: VoiceSocket | null = null
 let stopMic: (() => Promise<void>) | null = null
 let sendGate: AudioSendGate | null = null
@@ -88,14 +96,21 @@ function onEvent(event: ServerEvent) {
     if (stage === "waiting") micStatus.value = "正在等待开口"
     if (stage === "speech") micStatus.value = "听到说话了，识别会跟着更新"
     if (stage === "pause") micStatus.value = "停顿中，可以继续说"
+  } else if (type === "audio.progress") {
+    receivedSamples.value = Number(event.samples || 0)
+    receivedPeakText.value = formatLevel(Number(event.peak || 0))
+    if (receivedSamples.value > 16000 && Number(event.peak || 0) < 0.008) {
+      silenceHint.value = "服务端收到的声音一直很小。请检查是否选错麦克风，或系统是否把麦克风静音了。"
+    }
   } else if (type === "asr.partial" || type === "asr.final") {
-    draft.value = String(event.text || "")
-    if (type === "asr.final" && event.awaiting_edit) composer.value = draft.value
-    if (type === "asr.final" && !event.awaiting_edit) draft.value = ""
+    const text = String(event.text || "")
+    if (text) draft.value = text
+    if (type === "asr.final" && event.awaiting_edit) composer.value = text
+    if (type === "asr.final") micStatus.value = text ? "这句话已结束" : "没有识别到内容"
   } else if (type === "turn.started") {
     const id = `user-${event.turn_id}`
     messages.value.push({ id, role: "user", text: String(event.text || ""), status: "complete" })
-    draft.value = ""
+    micStatus.value = "这句话已放入对话"
     answering.value = true
   } else if (type === "llm.delta" || type === "llm.done") {
     upsertAssistant(String(event.turn_id), String(event.text || ""), type === "llm.done" ? "complete" : "streaming")
@@ -128,9 +143,15 @@ function resetCaptureWait() {
   asrFailedMessage = ""
   readyWaiters = []
   frameCount.value = 0
+  sentFrames.value = 0
   sampleCount.value = 0
-  levelPct.value = 0
+  levelText.value = "0.0"
+  peakText.value = "0.0"
+  receivedSamples.value = 0
+  receivedPeakText.value = "0.0"
   captureState.value = ""
+  silenceHint.value = ""
+  draft.value = ""
   micStatus.value = "正在打开麦克风"
 }
 
@@ -192,11 +213,14 @@ async function beginSpeech() {
   const generation = ++seqGuard
   resetCaptureWait()
   sendGate = new AudioSendGate((frame) => {
-    if (generation === seqGuard) socket?.sendAudio(frame)
+    if (generation !== seqGuard) return
+    sentFrames.value += 1
+    socket?.sendAudio(frame)
   })
   const playbackReady = player.resume()
   try {
     stopMic = await startCapture({
+      deviceId: deviceId.value,
       onFrame: (frame) => sendGate?.push(frame),
       onError: (message) => {
         if (generation === seqGuard) pushError(message)
@@ -206,10 +230,16 @@ async function beginSpeech() {
         captureState.value = stats.contextState
         frameCount.value = stats.frames
         sampleCount.value = stats.samples
-        levelPct.value = Math.round(stats.level * 100)
+        levelText.value = formatLevel(stats.level)
+        const previousPeak = Number(peakText.value) / 100
+        if (stats.level >= previousPeak) peakText.value = formatLevel(stats.level)
+        if (sampleCount.value > 16000 && Number(peakText.value) < 0.8) {
+          silenceHint.value = "采集电平一直很低。请换一个麦克风，或检查系统有没有把麦克风静音。"
+        }
       },
     })
     await playbackReady
+    await refreshDevices()
   } catch (error) {
     seqGuard += 1
     sendGate.close()
@@ -266,6 +296,21 @@ async function cancelSpeech() {
   phase.value = "待命"
 }
 
+async function refreshDevices() {
+  if (!navigator.mediaDevices?.enumerateDevices) return
+  const listed = await navigator.mediaDevices.enumerateDevices()
+  const inputs = listed.filter((item) => item.kind === "audioinput")
+  devices.value = inputs.map((item, index) => ({
+    id: item.deviceId,
+    label: item.label || `麦克风 ${index + 1}`,
+  }))
+  const selected = devices.value.find((item) => item.id === deviceId.value) || devices.value[0]
+  if (selected) {
+    deviceId.value = selected.id
+    currentDevice.value = selected.label
+  }
+}
+
 function submitText() {
   const text = composer.value.trim()
   if (!text) return
@@ -302,6 +347,7 @@ function onKeydown(event: KeyboardEvent) {
 
 onMounted(() => {
   player.setVolume(volume.value / 100)
+  void refreshDevices()
   void connect()
 })
 
@@ -338,14 +384,17 @@ onBeforeUnmount(() => {
       <label class="volume">音量
         <input v-model.number="volume" type="range" min="0" max="100" @input="onVolume" />
       </label>
+      <label class="volume">麦克风
+        <select v-model="deviceId" :disabled="listening">
+          <option v-if="devices.length === 0" value="">默认麦克风</option>
+          <option v-for="item in devices" :key="item.id" :value="item.id">{{ item.label }}</option>
+        </select>
+      </label>
+      <p class="hint">当前麦克风：{{ currentDevice }}</p>
       <label class="check">
         <input v-model="autoSend" type="checkbox" />
         识别完成后自动发送
       </label>
-      <p v-if="listening || micStatus" class="hint">{{ micStatus }}</p>
-      <p v-if="listening" class="hint">录音 {{ captureState || "启动中" }} · {{ frameCount }} 帧 / {{ sampleCount }} 样本 · 电平 {{ levelPct }}%</p>
-      <div v-if="listening" class="meter" aria-hidden="true"><span :style="{ width: levelPct + '%' }"></span></div>
-      <p v-if="draft" class="draft">实时转写：{{ draft }}</p>
       <p class="hint">{{ asrNote }}</p>
       <button type="button" class="secondary" @click="connect">重新连接</button>
     </section>
@@ -353,6 +402,15 @@ onBeforeUnmount(() => {
       <div v-if="secureHint" class="error">{{ secureHint }}</div>
       <div v-if="demoLabel" class="banner">{{ demoLabel }}</div>
       <div v-if="errorText" class="error">{{ errorText }}</div>
+      <section class="live-transcript" data-testid="live-transcript">
+        <h2>实时转写</h2>
+        <p data-testid="live-transcript-status">{{ micStatus || "还没开始" }}</p>
+        <p class="live-text" data-testid="live-transcript-text">{{ draft || "开口后，识别文字会显示在这里" }}</p>
+        <p class="hint">采集 {{ frameCount }} 帧 / {{ sampleCount }} 样本 · 已发送 {{ sentFrames }} 帧 · 服务端收到 {{ receivedSamples }} 样本</p>
+        <p class="hint">当前电平 {{ levelText }}% · 峰值 {{ peakText }}% · 服务端峰值 {{ receivedPeakText }}%</p>
+        <div class="meter" aria-hidden="true"><span :style="{ width: Math.min(100, Number(peakText)) + '%' }"></span></div>
+        <p v-if="silenceHint" class="error">{{ silenceHint }}</p>
+      </section>
       <div class="messages">
         <article v-for="item in messages" :key="item.id" class="bubble" :class="item.role">
           {{ item.text || "…" }}
@@ -360,11 +418,7 @@ onBeforeUnmount(() => {
           <span v-else-if="item.status === 'error'" class="badge">回答出错</span>
           <span v-else-if="item.status === 'streaming'" class="badge">正在生成</span>
         </article>
-        <article v-if="draft && listening" class="bubble user">
-          {{ draft }}
-          <span class="badge">正在识别</span>
-        </article>
-        <p v-if="messages.length === 0 && !(draft && listening)" class="meta">还没有对话。可以打字发送，也可以开始说话。</p>
+        <p v-if="messages.length === 0" class="meta">回答会出现在这里。正在说的话看上面的实时转写。</p>
       </div>
       <div class="composer">
         <textarea v-model="composer" placeholder="输入文字，或在关闭自动发送后修改识别结果" @keydown="onKeydown"></textarea>

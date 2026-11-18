@@ -8,7 +8,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from app.config import Settings
-from app.endpoint import UtteranceEndpoint
+from app.endpoint import UtteranceEndpoint, pcm_rms
 from app.ids import new_id
 from app.llm import LlmError
 from app.playback_gate import PlaybackGate
@@ -55,6 +55,11 @@ class Orchestrator:
         self.utterance_id = ""
         self.utterance_bytes = 0
         self.auto_submit = True
+        self.endpoint = None
+        self._listen_stage = ""
+        self._rx_frames = 0
+        self._rx_samples = 0
+        self._rx_peak = 0.0
         self.gate = PlaybackGate(settings.playback_max_inflight_bytes)
         self.closed = False
         self._tasks: set[asyncio.Task] = set()
@@ -151,7 +156,20 @@ class Orchestrator:
             )
             return
         self.utterance_bytes += len(pcm)
+        self._rx_frames += 1
+        self._rx_samples += len(pcm) // 2
+        self._rx_peak = max(self._rx_peak, pcm_rms(pcm))
         self.audio_q.put_nowait((seq, pcm))
+        if self._rx_frames == 1 or self._rx_frames % 8 == 0:
+            await self.emit(
+                {
+                    "type": "audio.progress",
+                    "frames": self._rx_frames,
+                    "samples": self._rx_samples,
+                    "peak": round(self._rx_peak, 4),
+                    "stage": self.endpoint.stage if self.endpoint else "waiting",
+                }
+            )
         if self.settings.endpoint_enabled and self.phase == "listening":
             should_finish = self.endpoint.feed(pcm)
             await self._emit_listen_stage()
@@ -172,6 +190,9 @@ class Orchestrator:
         self.utterance_bytes = 0
         self._auto_finish_started = False
         self._listen_stage = ""
+        self._rx_frames = 0
+        self._rx_samples = 0
+        self._rx_peak = 0.0
         self.endpoint = UtteranceEndpoint(
             self.settings.asr_sample_rate,
             onset_rms=self.settings.endpoint_onset_rms,
@@ -321,7 +342,10 @@ class Orchestrator:
         try:
             while not self.closed:
                 try:
-                    event = await self.asr.next_event(0.2)
+                    # None means the engine closed. A timed-out poll must not look like that:
+                    # the engines return None on timeout, and the first real partial can be
+                    # several seconds after audio starts.
+                    event = await asyncio.wait_for(self.asr.next_event(None), 0.2)
                 except TimeoutError:
                     if self.phase == "recognizing":
                         waited += 0.2

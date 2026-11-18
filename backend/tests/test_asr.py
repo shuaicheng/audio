@@ -14,6 +14,68 @@ from app.asr.realtime import RealtimeAsrEngine
 from app.config import Settings
 
 
+@pytest.mark.asyncio
+async def test_mock_partial_reaches_the_client_before_finish(settings):
+    import array
+
+    from app.asr.mock import MockAsrEngine
+    from app.orchestrator import Orchestrator
+    from app.protocol import encode_upstream_frame
+    from tests.conftest import collect
+
+    class _Idle:
+        async def stream(self, messages, cancelled):
+            if False:
+                yield ""
+
+    settings.max_audio_pending_chunks = 20
+    loud = array.array("h", [4000] * 8000).tobytes()
+    engine = MockAsrEngine(settings)
+    orch = Orchestrator(settings, lambda: engine, _Idle(), _Idle())
+    await orch.start_speech()
+    await orch.handle_audio(encode_upstream_frame(1, 16000, loud))
+    events, _ = await collect(orch, 0.3)
+    partials = [event for event in events if event["type"] == "asr.partial"]
+    assert partials
+    assert "不是真实识别" in partials[-1]["text"]
+    assert not any(event["type"] == "turn.started" for event in events)
+    await orch.close()
+
+
+@pytest.mark.asyncio
+async def test_partial_survives_the_idle_gap_before_the_first_word(settings):
+    """The first hypothesis can arrive seconds after capture starts. An idle poll must not close ASR."""
+    import array
+    import asyncio
+
+    from app.asr.mock import MockAsrEngine
+    from app.orchestrator import Orchestrator
+    from app.protocol import encode_upstream_frame
+    from tests.conftest import collect
+
+    class _Idle:
+        async def stream(self, messages, cancelled):
+            if False:
+                yield ""
+
+    settings.max_audio_pending_chunks = 20
+    loud = array.array("h", [4000] * 8000).tobytes()
+    engine = MockAsrEngine(settings)
+    orch = Orchestrator(settings, lambda: engine, _Idle(), _Idle())
+    await orch.start_speech()
+    await asyncio.sleep(0.35)
+    await orch.handle_audio(encode_upstream_frame(1, 16000, loud))
+    events, _ = await collect(orch, 0.4)
+    partials = [event for event in events if event["type"] == "asr.partial"]
+    assert partials
+    assert "不是真实识别" in partials[-1]["text"]
+    await orch.finish_speech(auto_submit=True)
+    finished, _ = await collect(orch, 0.4)
+    assert any(event["type"] == "asr.final" for event in finished)
+    assert sum(1 for event in finished if event["type"] == "turn.started") == 1
+    await orch.close()
+
+
 def test_transcript_revision_rules():
     assert merge_hypothesis("你好", "世界") == "你好世界"
     assert merge_hypothesis("你好", "你好世界") == "你好世界"

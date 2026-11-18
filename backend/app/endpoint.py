@@ -36,7 +36,7 @@ class UtteranceEndpoint:
         if self.fired or len(pcm) < 2:
             return False
         moment = self.clock() if now is None else now
-        rms = _rms(pcm)
+        rms = pcm_rms(pcm)
         if self.stage == "waiting":
             if rms >= self.onset_rms:
                 if self._onset_at is None:
@@ -63,7 +63,7 @@ class UtteranceEndpoint:
         return False
 
 
-def _rms(pcm: bytes) -> float:
+def pcm_rms(pcm: bytes) -> float:
     usable = pcm[: len(pcm) - (len(pcm) % 2)]
     samples = array.array("h")
     samples.frombytes(usable)

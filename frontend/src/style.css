@@ -104,6 +104,10 @@ button.warn {
 .banner { background: #f3d7a1; color: #3f2a09; }
 .error { background: #f8d7d1; color: #6d241c; }
 
+.live-transcript { background: white; border: 2px solid #c23a2e; border-radius: 16px; padding: 0.9rem 1rem; }
+.live-transcript h2 { margin: 0; font-size: 1rem; }
+.live-text { min-height: 3.2rem; margin: 0.45rem 0; font-size: 1.35rem; line-height: 1.5; }
+select { width: 100%; border-radius: 12px; padding: 0.45rem 0.6rem; }
 .messages { flex: 1; overflow: auto; display: flex; flex-direction: column; gap: 0.7rem; padding-right: 0.2rem; }
 .bubble { max-width: min(100%, 42rem); padding: 0.8rem 0.9rem; border-radius: 16px; white-space: pre-wrap; line-height: 1.6; }
 .bubble.user { align-self: flex-end; background: #2a241e; color: #f6f1e7; }
