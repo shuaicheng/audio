@@ -82,7 +82,12 @@ function onEvent(event: ServerEvent) {
     answering.value = name === "answering"
   } else if (type === "speech.started" || type === "asr.ready") {
     markAsrReady()
-    micStatus.value = "识别已就绪，正在发送音频"
+    micStatus.value = "正在等待开口"
+  } else if (type === "listen.activity") {
+    const stage = String(event.stage || "")
+    if (stage === "waiting") micStatus.value = "正在等待开口"
+    if (stage === "speech") micStatus.value = "听到说话了，识别会跟着更新"
+    if (stage === "pause") micStatus.value = "停顿中，可以继续说"
   } else if (type === "asr.partial" || type === "asr.final") {
     draft.value = String(event.text || "")
     if (type === "asr.final" && event.awaiting_edit) composer.value = draft.value
@@ -216,13 +221,17 @@ async function beginSpeech() {
   socket?.send({ type: "speech.start", auto_submit: autoSend.value })
   listening.value = true
   phase.value = "正在聆听"
-  micStatus.value = "录音已启动，正在采集"
+  micStatus.value = "正在等待开口"
   window.setTimeout(() => {
     if (generation !== seqGuard || !listening.value) return
     if (sampleCount.value === 0) {
       pushError("录音模块没有交出采样。请看浏览器是否允许麦克风；若刚允许，请再点一次「开始说话」。")
     }
   }, 1500)
+  window.setTimeout(() => {
+    if (generation !== seqGuard || !listening.value) return
+    if (micStatus.value === "正在等待开口") micStatus.value = "仍在等待开口，可以直接说"
+  }, 20000)
 }
 
 async function finishSpeech() {

@@ -152,14 +152,12 @@ class Orchestrator:
             return
         self.utterance_bytes += len(pcm)
         self.audio_q.put_nowait((seq, pcm))
-        if (
-            self.settings.endpoint_enabled
-            and self.phase == "listening"
-            and not self._auto_finish_started
-            and self.endpoint.feed(pcm)
-        ):
-            self._auto_finish_started = True
-            self._track(asyncio.create_task(self.finish_speech(auto_submit=self.auto_submit)))
+        if self.settings.endpoint_enabled and self.phase == "listening":
+            should_finish = self.endpoint.feed(pcm)
+            await self._emit_listen_stage()
+            if should_finish and not self._auto_finish_started:
+                self._auto_finish_started = True
+                self._track(asyncio.create_task(self.finish_speech(auto_submit=self.auto_submit)))
 
     async def start_speech(self) -> None:
         if self.closed:
@@ -173,11 +171,13 @@ class Orchestrator:
         self.utterance_id = new_id("utt")
         self.utterance_bytes = 0
         self._auto_finish_started = False
+        self._listen_stage = ""
         self.endpoint = UtteranceEndpoint(
             self.settings.asr_sample_rate,
-            speech_rms=self.settings.endpoint_speech_rms,
+            onset_rms=self.settings.endpoint_onset_rms,
+            release_rms=self.settings.endpoint_release_rms,
+            onset_ms=self.settings.endpoint_onset_ms,
             silence_ms=self.settings.endpoint_silence_ms,
-            min_speech_ms=self.settings.endpoint_min_speech_ms,
         )
         self.audio_q = asyncio.Queue(maxsize=max(1, self.settings.max_audio_pending_chunks))
         await self.asr.start()
@@ -198,6 +198,20 @@ class Orchestrator:
             }
         )
         await self.emit_state()
+        await self._emit_listen_stage()
+
+    async def _emit_listen_stage(self) -> None:
+        stage = getattr(self.endpoint, "stage", "")
+        if not stage or stage == self._listen_stage:
+            return
+        self._listen_stage = stage
+        await self.emit(
+            {
+                "type": "listen.activity",
+                "stage": stage,
+                "utterance_id": self.utterance_id,
+            }
+        )
 
     async def finish_speech(self, auto_submit: bool = True) -> None:
         if self.phase != "listening":

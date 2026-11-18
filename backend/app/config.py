@@ -75,9 +75,10 @@ class Settings(BaseSettings):
     history_max_turns: int = 16
     mock_token_delay_sec: float = 0.02
     endpoint_enabled: bool = True
-    endpoint_silence_ms: int = 900
-    endpoint_min_speech_ms: int = 300
-    endpoint_speech_rms: float = 0.018
+    endpoint_onset_ms: int = 480
+    endpoint_silence_ms: int = 1400
+    endpoint_onset_rms: float = 0.05
+    endpoint_release_rms: float = 0.02
 
     secrets_fingerprint: str = Field(default="", exclude=True)
 

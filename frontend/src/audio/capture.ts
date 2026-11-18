@@ -71,7 +71,12 @@ export async function startCapture(hooks: {
   const context = new AudioContext()
   await resumeOrThrow(context)
   const stream = await navigator.mediaDevices.getUserMedia({
-    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+    audio: {
+      channelCount: 1,
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: false,
+    },
     video: false,
   })
   await resumeOrThrow(context)
