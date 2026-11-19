@@ -160,7 +160,8 @@ function onEvent(event: ServerEvent) {
           .filter(Boolean)
           .join("；")
       : ""
-    correctNote.value = [correctReason(reason), elapsed ? `用时 ${elapsed} 毫秒。` : "", changeText ? `${changeText}。` : ""].filter(Boolean).join("")
+    const detail = String(event.detail || "")
+    correctNote.value = [correctReason(reason), elapsed ? `用时 ${elapsed} 毫秒。` : "", changeText ? `${changeText}。` : "", detail ? `${detail}。` : ""].filter(Boolean).join("")
     micStatus.value = correctReason(reason)
   } else if (type === "turn.started") {
     const id = `user-${event.turn_id}`

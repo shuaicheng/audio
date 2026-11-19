@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import time
 
@@ -50,10 +51,12 @@ async def _live() -> int:
         return 0
     elapsed = time.monotonic() - started
     print(
-        f"live_reason={result.reason} live_source={result.source} "
-        f"live_elapsed_sec={elapsed:.2f} original_chars={len(result.original)} result_chars={len(result.text)}"
+        f"live_reason={result.reason} live_source={result.source} accepted={result.accepted} "
+        f"live_elapsed_sec={elapsed:.2f} original_chars={len(result.original)} result_chars={len(result.text)} "
+        f"changed={result.text != result.original}"
     )
-    print("live_note=这是一次独立校正请求，不是对话回答，也不表示识别已经准确。")
+    print("diagnostic=" + json.dumps(result.diagnostic, ensure_ascii=False, sort_keys=True))
+    print("live_note=这是一次独立校正请求，不是对话回答，也不表示识别已经准确。不打印正文和密钥。")
     return 0
 
 
